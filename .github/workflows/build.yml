@@ -1,0 +1,49 @@
+name: Build BigSurface (SLS2)
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get BigSurface source
+        run: |
+          git clone https://github.com/Xiashangning/BigSurface.git
+          cd BigSurface
+          git checkout 82826312a429ede6e6f8441d49de2e2096b69ae4
+          git submodule update --init --recursive
+          git apply ../patches/BigSurface-SLS2.patch
+          (cd Dependencies/VoodooSerial && git apply ../../../patches/VoodooSerial-SLS2.patch)
+
+      - name: Get Lilu and VirtualSMC SDK (DEBUG builds)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd BigSurface/Dependencies
+          for name in Lilu VirtualSMC; do
+            gh release download -R acidanthera/$name --pattern '*DEBUG.zip' -O $name.zip
+            mkdir -p tmp-$name && unzip -q -o $name.zip -d tmp-$name
+            ditto "$(find tmp-$name -name $name.kext -maxdepth 3 | head -1)" $name.kext
+            rm -rf tmp-$name $name.zip
+          done
+          ls
+
+      - name: Build
+        run: |
+          cd BigSurface
+          xcodebuild -workspace BigSurface.xcworkspace -scheme BigSurface -configuration Release \
+            -derivedDataPath ../dd CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO build \
+            | tail -40
+          OUT=$(find ../dd -path '*Release/BigSurface.kext' -maxdepth 6 | head -1)
+          test -n "$OUT"
+          mkdir -p ../out && ditto "$OUT" ../out/BigSurface.kext
+          ls -R ../out | head -40
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: BigSurface-SLS2
+          path: out/

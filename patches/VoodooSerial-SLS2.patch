@@ -1,0 +1,56 @@
+diff --git a/VoodooSerial/Info.plist b/VoodooSerial/Info.plist
+index b8fd797..592b536 100644
+--- a/VoodooSerial/Info.plist
++++ b/VoodooSerial/Info.plist
+@@ -64,7 +64,7 @@
+ 			<key>IOClass</key>
+ 			<string>VoodooUARTController</string>
+ 			<key>IOPCIMatch</key>
+-			<string>0x34a88086 0x9d278086</string>
++			<string>0x34a88086 0x9d278086 0x51a88086</string>
+ 			<key>IOProbeScore</key>
+ 			<integer>400</integer>
+ 			<key>IOProviderClass</key>
+diff --git a/VoodooSerial/VoodooUART/VoodooUARTController.cpp b/VoodooSerial/VoodooUART/VoodooUARTController.cpp
+index 5094097..8c0e408 100644
+--- a/VoodooSerial/VoodooUART/VoodooUARTController.cpp
++++ b/VoodooSerial/VoodooUART/VoodooUARTController.cpp
+@@ -102,7 +102,16 @@ void VoodooUARTController::startUARTClock() {
+         writeRegister(UART_UPDATE_CLK | CALC_CLK(8, 15) | UART_ENABLE_CLK, LPSS_PRIV + LPSS_UART_CLK);
+     else if (device.device_id == 0x9d27)
+         writeRegister(UART_UPDATE_CLK | CALC_CLK(2, 5) | UART_ENABLE_CLK, LPSS_PRIV + LPSS_UART_CLK);
+-    else
++    else if (device.device_id == 0x51a8) {
++        // Alder/Raptor Lake-P LPSS UART (Surface Laptop Studio 2). The input clock is assumed
++        // to be 100 MHz, so 16/25 gives the same 64 MHz the Ice Lake path ends up with.
++        // UNTESTED: override with boot-args vsuartm=<M> vsuartn=<N> if the keyboard stays silent.
++        UInt32 m = 16, n = 25;
++        PE_parse_boot_argn("vsuartm", &m, sizeof(m));
++        PE_parse_boot_argn("vsuartn", &n, sizeof(n));
++        LOG("ADL-P UART clock M/N = %u/%u", m, n);
++        writeRegister(UART_UPDATE_CLK | CALC_CLK(m, n) | UART_ENABLE_CLK, LPSS_PRIV + LPSS_UART_CLK);
++    } else
+         LOG("Unknown UART type");
+ }
+ 
+@@ -374,7 +383,7 @@ IOReturn VoodooUARTController::prepareCommunication() {
+     toggleInterruptType(UART_IER_ENABLE_RX_AVAIL_INT | UART_IER_ENABLE_ERR_INT, true);
+     
+     // Surface Pro 6 quirk, wait for UART to sync
+-    if (device.device_id == 0x9d27)
++    if (device.device_id == 0x9d27 || device.device_id == 0x51a8)
+         IOSleep(50);
+     
+     interrupt_simulator->enable();
+diff --git a/VoodooSerial/VoodooUART/VoodooUARTController.hpp b/VoodooSerial/VoodooUART/VoodooUARTController.hpp
+index ab58dba..1e3cb5d 100644
+--- a/VoodooSerial/VoodooUART/VoodooUARTController.hpp
++++ b/VoodooSerial/VoodooUART/VoodooUARTController.hpp
+@@ -21,6 +21,7 @@
+ #include <IOKit/IOTimerEventSource.h>
+ #include <IOKit/IOInterruptEventSource.h>
+ #include <IOKit/pci/IOPCIDevice.h>
++#include <pexpert/pexpert.h>
+ 
+ #include "../ACPIParser/VoodooACPIResourcesParser.hpp"
+ #include "../helpers.hpp"

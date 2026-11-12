@@ -1,0 +1,18 @@
+diff --git a/BigSurface/BigSurface/SurfaceSerialHubDevices/SurfaceHIDNub.cpp b/BigSurface/BigSurface/SurfaceSerialHubDevices/SurfaceHIDNub.cpp
+index a7c5d49..d89c80c 100644
+--- a/BigSurface/BigSurface/SurfaceSerialHubDevices/SurfaceHIDNub.cpp
++++ b/BigSurface/BigSurface/SurfaceSerialHubDevices/SurfaceHIDNub.cpp
+@@ -74,8 +74,11 @@ IOReturn SurfaceHIDNub::registerHIDEvent(OSObject* owner, EventHandler _handler)
+         ret = ssh->registerEvent(this, SurfaceSerialEventHostManagedV1, SSH_TC_KBD, SurfaceLegacyKeyboardDevice);
+     else {
+         ret = ssh->registerEvent(this, SurfaceSerialEventHostManagedV2, SSH_TC_HID, SurfaceKeyboardDevice);
+-        if (ret == kIOReturnSuccess)
+-            ret = ssh->registerEvent(this, SurfaceSerialEventHostManagedV2, SSH_TC_HID, SurfaceTouchpadDevice);
++        // Surface Laptop Studio 2 has no SAM touchpad (it is on Intel THC), so a failed touchpad
++        // registration must not take the keyboard down with it.
++        if (ret == kIOReturnSuccess &&
++            ssh->registerEvent(this, SurfaceSerialEventHostManagedV2, SSH_TC_HID, SurfaceTouchpadDevice) != kIOReturnSuccess)
++            LOG("No SAM touchpad, keyboard only");
+     }
+     if (ret != kIOReturnSuccess)
+         return ret;
