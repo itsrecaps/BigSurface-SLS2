@@ -2,6 +2,7 @@ name: Build BigSurface (SLS2)
 
 on:
   push:
+    paths: ['patches/**', '.github/workflows/build.yml']
   workflow_dispatch:
 
 jobs:

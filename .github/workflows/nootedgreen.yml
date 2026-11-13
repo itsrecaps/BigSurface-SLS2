@@ -1,0 +1,23 @@
+name: Build NootedGreen (SLS2)
+
+on:
+  push:
+    paths: ['nootedgreen/**', '.github/workflows/nootedgreen.yml']
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: |
+          cd nootedgreen
+          zsh build-nootedgreen.sh
+          file build/NootedGreen.kext/Contents/MacOS/NootedGreen
+          strings build/NootedGreen.kext/Contents/MacOS/NootedGreen | grep "SLS2" | head
+          mkdir -p ../out && ditto build/NootedGreen.kext ../out/NootedGreen.kext
+      - uses: actions/upload-artifact@v4
+        with:
+          name: NootedGreen-SLS2
+          path: out/
