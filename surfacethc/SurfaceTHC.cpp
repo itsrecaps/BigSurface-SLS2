@@ -274,11 +274,44 @@ void SurfaceTHCProbe::bringUp(IOACPIPlatformDevice *acpi) {
 	note("reset-pio", (uint64_t)(int64_t)e); noteBytes("reset-body", buf, got > 64 ? 64 : got);
 
 	// 7. DEVICE_DESCRIPTOR request: output header {type=1, len=0, id=0}
-	uint32_t req = 0x00000001;
-	e = pioWrite(out, 4, &req);
-	note("desc-write-pio", (uint64_t)(int64_t)e);
-	if (e) { noteStr("result", "descriptor request write failed"); goto done; }
-	irq = waitNonDmaInt(5000, &cause);
+	// Round 1 showed WR_OPCODE reads back 0 after writing it in the QIO field, so log what
+	// each layout reads back and try a few write modes until the device answers.
+	{
+		static const uint32_t probes[] = {0xE2u << 8, 0xE2u << 24, 0xE2u, 0xE2u << 16, 0xE2E2E2E2u};
+		OSArray *rb = OSArray::withCapacity(5);
+		for (uint32_t p : probes) {
+			wr(THC_M_PRT_SPI_WR_OPCODE_OFFSET, p);
+			OSNumber *n = OSNumber::withNumber(rd(THC_M_PRT_SPI_WR_OPCODE_OFFSET), 32);
+			if (rb && n) rb->setObject(n);
+			OSSafeReleaseNULL(n);
+		}
+		if (rb) { log->setObject("wrop-readback", rb); rb->release(); }
+	}
+	struct Try { uint32_t mode, op, reg; };
+	const Try tries[] = {
+		{wmode, wop, opc(wmode, wop)},
+		{wmode, wop, 0xE2E2E2E2u},
+		{0, wop, wop << 24},
+		{0, 0x02, 0x02u << 24},
+	};
+	irq = false;
+	OSArray *att = OSArray::withCapacity(4);
+	for (unsigned t = 0; t < 4 && !irq; t++) {
+		wbits(THC_M_PRT_SPI_CFG_OFFSET, THC_M_PRT_SPI_CFG_SPI_TWMODE, tries[t].mode << 18);
+		wr(THC_M_PRT_SPI_WR_OPCODE_OFFSET, tries[t].reg);
+		wr(THC_M_PRT_READ_DMA_INT_STS_1_OFFSET, NONDMA_INT_STS_BIT);
+		uint32_t req = 0x00000001;
+		e = pioWrite(out, 4, &req);
+		irq = (e == 0) && waitNonDmaInt(1500, &cause);
+		char msg[96];
+		snprintf(msg, sizeof(msg), "try%u mode%u op0x%x reg0x%x rb0x%x pio%d irq%d cause0x%x", t, tries[t].mode, tries[t].op,
+		         tries[t].reg, rd(THC_M_PRT_SPI_WR_OPCODE_OFFSET), e, irq, cause);
+		OSString *m = OSString::withCString(msg);
+		if (att && m) att->setObject(m);
+		OSSafeReleaseNULL(m);
+		IOLog("SurfaceTHC: %s %s\n", acpi->getName(), msg);
+	}
+	if (att) { log->setObject("desc-attempts", att); att->release(); }
 	note("desc-irq", irq); note("desc-cause", cause);
 	if (!irq) { noteStr("result", "no DEVICE_DESCRIPTOR response"); goto done; }
 	len = ((cause >> 8) & 0x3FFF) * 4;
