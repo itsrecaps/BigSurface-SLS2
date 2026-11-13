@@ -1138,6 +1138,14 @@ static void sls2ApplyStolenFix(KernelPatcher &patcher, KernelPatcher::KextInfo *
 		return;
 	}
 	uint32_t bytes = ((gms & 0x0F) + 1) * 4 * 1024 * 1024;
+	// The top of Gen11+ stolen memory is reserved by firmware (WOPCM/GuC area), so the part
+	// macOS may use is smaller than GMS says. Using the whole thing put the hardware cursor
+	// into the reserved tail (glitched cursor). Keep 8 MiB back by default; boot-arg
+	// sls2rsv=<MiB> overrides it (0..32).
+	uint32_t rsvMiB = 8;
+	PE_parse_boot_argn("sls2rsv", &rsvMiB, sizeof(rsvMiB));
+	if (rsvMiB > 32) rsvMiB = 32;
+	bytes -= rsvMiB * 1024 * 1024;
 	bool ok;
 	if (hw) {
 		// IGMemoryManager::initSegments: movzwl %ax,%r14d / andl $0xff00,%r14d / shlq $0x11,%r14
