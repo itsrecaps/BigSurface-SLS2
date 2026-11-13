@@ -1130,6 +1130,8 @@ static void fbTimingsWorker(thread_call_param_t, thread_call_param_t) {
 // Firmware that sets GMS in the 0xF0-0xFE range (4 MiB steps, e.g. 0xFE = 60 MiB on the Surface Laptop Studio 2)
 // makes that decode wrap to ~4 GiB, IGAccelTask::initAllocators fails and IGAccelTask::withOptions panics in
 // IOAccelTask::release (CR2 0xc78). Replace the decode with the real size in both kexts.
+static uint32_t gSls2StolenBytes = 0;
+
 static void sls2ApplyStolenFix(KernelPatcher &patcher, KernelPatcher::KextInfo *kext, mach_vm_address_t address,
 	size_t size, bool hw) {
 	uint32_t gms = NGreen::callback->rawGms;
@@ -1146,6 +1148,7 @@ static void sls2ApplyStolenFix(KernelPatcher &patcher, KernelPatcher::KextInfo *
 	PE_parse_boot_argn("sls2rsv", &rsvMiB, sizeof(rsvMiB));
 	if (rsvMiB > 32) rsvMiB = 32;
 	bytes -= rsvMiB * 1024 * 1024;
+	gSls2StolenBytes = bytes;
 	bool ok;
 	if (hw) {
 		// IGMemoryManager::initSegments: movzwl %ax,%r14d / andl $0xff00,%r14d / shlq $0x11,%r14
@@ -4751,6 +4754,25 @@ uint64_t Gen11::getOSInformation(AppleIntel::AppleIntelBaseController *that)
 		pinfo[1].connectors[2] = { 2, 2, 2, 0, ConnectorDummy, 0 };
 		pinfo[1].connectors[3] = { 3, 3, 3, 0, ConnectorDummy, 0 };
 
+		// SLS2: the FB log said "FBMemMgr_Init Insufficient stolen memory". Make the per
+		// framebuffer stolen budget fit what the BIOS actually gives (GMS 0xFE).
+		{
+			uint32_t avail = gSls2StolenBytes;
+			uint32_t fbm = pinfo[1].fInfoFramebufferMemorySize, fbc = pinfo[1].fInfoFBCompressionMemorySize;
+			uint32_t cnt = pinfo[1].fInfoFramebufferCount ? pinfo[1].fInfoFramebufferCount : 1;
+			SYSLOG("ngreen", "SLS2 stolen budget: avail=0x%x fbmem=0x%x fbc=0x%x count=%u", avail, fbm, fbc, cnt);
+			if (avail && (uint64_t)fbm * cnt + fbc > avail) {
+				uint32_t mib = 1024 * 1024;
+				uint32_t per = ((avail / cnt) / mib) * mib;
+				if (per < 16 * mib) per = 16 * mib;   // 2400x1600x4 needs ~15 MiB
+				if (per < fbm) pinfo[1].fInfoFramebufferMemorySize = per;
+				if ((uint64_t)pinfo[1].fInfoFramebufferMemorySize * cnt + fbc > avail) {
+					pinfo[1].fInfoFBCompressionMemorySize = 0;
+					pinfo[1].fInfoFlags &= ~FB_FLAG_FRAMEBUFFER_COMPRESSION;
+				}
+				SYSLOG("ngreen", "SLS2 stolen budget fixed: fbmem=0x%x fbc=0x%x", pinfo[1].fInfoFramebufferMemorySize, pinfo[1].fInfoFBCompressionMemorySize);
+			}
+		}
 		SYSLOG("ngreen", "getOSInformation: patched pinfo[1] for ADL-P (LVDS+HDMI, mobile)");
 	}
 	return FunctionCast(getOSInformation, callback->ogetOSInformation)(that);
