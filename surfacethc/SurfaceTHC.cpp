@@ -378,8 +378,11 @@ void SurfaceTHCProbe::listen() {
 			OSDictionary *d = OSDictionary::withCapacity(4);
 			if (d) {
 				setNum2(d, "reports", count); setNum2(d, "read-errors", readErr);
-				if (first) d->setObject("first", first);
-				d->setObject("by-type", types);
+				// Registry collections are frozen once published, so publish copies.
+				OSArray *fc = first ? OSArray::withArray(first) : nullptr;
+				OSDictionary *tc = OSDictionary::withDictionary(types);
+				if (fc) { d->setObject("first", fc); fc->release(); }
+				if (tc) { d->setObject("by-type", tc); tc->release(); }
 				setProperty("THC-listen", d); d->release();
 			}
 		}
@@ -387,8 +390,10 @@ void SurfaceTHCProbe::listen() {
 	OSDictionary *d = OSDictionary::withCapacity(4);
 	if (d) {
 		setNum2(d, "reports", count); setNum2(d, "read-errors", readErr);
-		if (first) d->setObject("first", first);
-		if (types) d->setObject("by-type", types);
+		OSArray *fc = first ? OSArray::withArray(first) : nullptr;
+		OSDictionary *tc = types ? OSDictionary::withDictionary(types) : nullptr;
+		if (fc) { d->setObject("first", fc); fc->release(); }
+		if (tc) { d->setObject("by-type", tc); tc->release(); }
 		OSString *st = OSString::withCString(stopping ? "stopped" : "finished 90 s window");
 		if (st) { d->setObject("state", st); st->release(); }
 		setProperty("THC-listen", d); d->release();
