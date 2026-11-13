@@ -372,6 +372,34 @@ void SurfaceTHCProbe::bringUp(IOACPIPlatformDevice *acpi) {
 		note("report-desc-len", le16(4)); note("max-input-len", le16(6)); note("max-output-len", le16(8));
 		note("vendor-id", le16(12)); note("product-id", le16(14)); note("version-id", le16(16));
 		noteStr("result", "OK got device descriptor");
+		// Step 2 for multitouch: ask for the HID report descriptor (HIDSPI output type 2) and try to
+		// read it in 64-byte PIO chunks (address increment is enabled in DEVINT_CFG_2).
+		uint32_t rdLen = le16(4);
+		if (rdLen && rdLen <= 4096) {
+			uint32_t rq = 0x00000002;
+			int we = pioWrite(out, 4, &rq);
+			uint32_t c2 = 0;
+			bool ri = (we == 0) && waitNonDmaInt(2000, &c2);
+			note("rdesc-write", (uint64_t)(int64_t)we); note("rdesc-irq", ri); note("rdesc-cause", c2);
+			if (ri) {
+				uint32_t total = ((c2 >> 8) & 0x3FFF) * 4;
+				note("rdesc-total", total);
+				uint8_t *rd = (uint8_t *)IOMalloc(4608);
+				if (rd && total && total <= 4608) {
+					bzero(rd, 4608);
+					uint32_t off = 0; int pe = 0;
+					while (off < total && !pe) {
+						uint32_t chunk = total - off > 64 ? 64 : total - off, g = 0, cb[16] = {0};
+						pe = pioRead(bdy + off, (chunk + 3) & ~3u, cb, &g);
+						if (!pe) memcpy(rd + off, cb, chunk);
+						off += chunk;
+					}
+					note("rdesc-pio", (uint64_t)(int64_t)pe);
+					noteBytes("rdesc", rd, total);
+				}
+				if (rd) IOFree(rd, 4608);
+			}
+		}
 	} else noteStr("result", "descriptor response looked wrong");
 	}
 done:
