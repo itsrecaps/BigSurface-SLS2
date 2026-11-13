@@ -1,7 +1,7 @@
 #!/bin/zsh
 set -e
 ROOT=${0:A:h}
-DEPS=$ROOT/build/deps; OUT=$ROOT/build/SurfaceTHC.kext; NAME=SurfaceTHC; BID=com.itsrecaps.SurfaceTHC; VER=0.5.1
+DEPS=$ROOT/build/deps; OUT=$ROOT/build/SurfaceTHC.kext; NAME=SurfaceTHC; BID=com.itsrecaps.SurfaceTHC; VER=0.6.0
 mkdir -p $DEPS
 [[ -d $DEPS/MacKernelSDK ]] || git clone --depth 1 https://github.com/acidanthera/MacKernelSDK.git $DEPS/MacKernelSDK
 SDK=$DEPS/MacKernelSDK; TMP=$(mktemp -d)

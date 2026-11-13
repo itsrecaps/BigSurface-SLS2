@@ -14,11 +14,13 @@
 #include <libkern/c++/OSString.h>
 #include <libkern/c++/OSArray.h>
 #include "intel-thc-hw.h"
+#include "voodooinput/VoodooInputMessages.h"
 #include <IOKit/hid/IOHIDDevice.h>
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <kern/thread.h>
 #include <pexpert/pexpert.h>
 #include <mach/mach_time.h>
+#include <kern/clock.h>
 
 class SurfaceTHCProbe : public IOService {
 	OSDeclareDefaultStructors(SurfaceTHCProbe)
@@ -32,6 +34,18 @@ private:
 	char acpiName[8] {0};
 	IOACPIPlatformDevice *acpiDev {nullptr};
 	IOService *mouse {nullptr};
+	IOService *voodoo {nullptr};
+	bool ptp {false};
+	uint32_t outAddr {0};
+	VoodooInputEvent vevt;
+	TouchCoordinates prevCoord[8];
+	int setFeature(uint8_t id, uint8_t value);
+	void handlePtp(const uint8_t *c, uint32_t n);
+public:
+	bool handleOpen(IOService *forClient, IOOptionBits options, void *arg) override;
+	void handleClose(IOService *forClient, IOOptionBits options) override;
+	bool handleIsOpen(const IOService *forClient) const override;
+private:
 	static bool checkThcTest() { int v = 0; return PE_parse_boot_argn("-thctest", &v, sizeof(v)); }
 	static void listenEntry(void *arg, wait_result_t);
 	void listen();
@@ -400,6 +414,21 @@ void SurfaceTHCProbe::bringUp(IOACPIPlatformDevice *acpi) {
 				if (rd) IOFree(rd, 4608);
 			}
 		}
+		outAddr = out;
+		if (le16(14) == 0x0C46) {
+			// Precision touchpad: Input Mode (feature 0x84) = 3, Selective Reporting (0x85) = surface + button
+			int a = setFeature(0x84, 3), b2 = setFeature(0x85, 3);
+			note("ptp-inputmode", (uint64_t)(int64_t)a); note("ptp-selective", (uint64_t)(int64_t)b2);
+			if (a == 0) {
+				ptp = true;
+				setProperty("VoodooInputSupported", kOSBooleanTrue);
+				setProperty(VOODOO_INPUT_LOGICAL_MAX_X_KEY, 4095, 32);
+				setProperty(VOODOO_INPUT_LOGICAL_MAX_Y_KEY, 4095, 32);
+				setProperty(VOODOO_INPUT_PHYSICAL_MAX_X_KEY, 12000, 32);   // 120.0 mm in 0.01 mm
+				setProperty(VOODOO_INPUT_PHYSICAL_MAX_Y_KEY, 8000, 32);    // 80.0 mm
+				setProperty(VOODOO_INPUT_TRANSFORM_KEY, 0ull, 8);
+			}
+		}
 	} else noteStr("result", "descriptor response looked wrong");
 	}
 done:
@@ -410,6 +439,65 @@ done:
 	if (OSString *r = OSDynamicCast(OSString, log->getObject("result")))
 		IOLog("SurfaceTHC: %s bring-up: %s\n", acpi->getName(), r->getCStringNoCopy());
 	OSSafeReleaseNULL(log);
+}
+
+// ---------- precision touchpad (report 0x81) -> VoodooInput ----------
+int SurfaceTHCProbe::setFeature(uint8_t id, uint8_t value) {
+	// HIDSPI output report: type 3 = SET_FEATURE, content_len = 1, content_id = report id
+	uint32_t pkt[2] = { (uint32_t)0x03 | (1u << 8) | ((uint32_t)id << 24), value };
+	int e = pioWrite(outAddr, 8, pkt);
+	if (e) return e;
+	uint32_t cause = 0, buf[16], got = 0;
+	if (!waitNonDmaInt(1000, &cause)) return -10;
+	uint32_t len = ((cause >> 8) & 0x3FFF) * 4;
+	pioRead(bodyAddr ? bodyAddr : 0x1004, len == 0 ? 4 : (len > 64 ? 64 : len), buf, &got);   // SET_FEATURE_RESPONSE
+	return 0;
+}
+
+bool SurfaceTHCProbe::handleOpen(IOService *forClient, IOOptionBits options, void *arg) {
+	if (forClient && forClient->getProperty(VOODOO_INPUT_IDENTIFIER)) { voodoo = forClient; return true; }
+	return IOService::handleOpen(forClient, options, arg);
+}
+void SurfaceTHCProbe::handleClose(IOService *forClient, IOOptionBits options) {
+	if (forClient == voodoo) { voodoo = nullptr; return; }
+	IOService::handleClose(forClient, options);
+}
+bool SurfaceTHCProbe::handleIsOpen(const IOService *forClient) const {
+	if (forClient && forClient == voodoo) return true;
+	return IOService::handleIsOpen(forClient);
+}
+
+void SurfaceTHCProbe::handlePtp(const uint8_t *c, uint32_t n) {
+	if (!voodoo || n < 29) return;
+	uint64_t now; clock_get_uptime(&now);
+	bool button = c[28] & 1;
+	uint8_t active = 0;
+	bzero(&vevt, sizeof(vevt));
+	for (int i = 0; i < 5; i++) {
+		const uint8_t *f = c + i * 5;
+		bool conf = f[0] & 1, tip = f[0] & 2;
+		uint8_t id = (f[0] >> 2) & 7;
+		uint32_t x = f[1] | (f[2] << 8), y = f[3] | (f[4] << 8);
+		if (!tip && !(f[0] & 0x1C) && !x && !y) continue;   // empty slot
+		VoodooInputTransducer &t = vevt.transducers[active];
+		t.type = FINGER;
+		t.secondaryId = id;
+		t.fingerType = (MT2FingerType)(kMT2FingerTypeIndexFinger + (active % 4));
+		t.timestamp = now;
+		t.isValid = conf;
+		t.isTransducerActive = tip;
+		t.isPhysicalButtonDown = button;
+		t.supportsPressure = false;
+		t.previousCoordinates = prevCoord[id];
+		t.currentCoordinates.x = x;
+		t.currentCoordinates.y = y;
+		t.currentCoordinates.width = 10;
+		prevCoord[id] = t.currentCoordinates;
+		active++;
+	}
+	vevt.contact_count = active;
+	vevt.timestamp = now;
+	voodoo->message(kIOMessageVoodooInputMessage, this, &vevt);
 }
 
 // ---------- listen mode: poll for touch reports for 10 minutes and record what arrives ----------
@@ -427,7 +515,7 @@ void SurfaceTHCProbe::listen() {
 	OSArray *first = OSArray::withCapacity(16);
 	OSDictionary *types = OSDictionary::withCapacity(8);
 	char key[16];
-	for (uint32_t loops = 0; !stopping && (mouse || loops < 45000); loops++) {   // 90 s unless it turned out to be the touchpad
+	for (uint32_t loops = 0; !stopping && (mouse || ptp || loops < 45000); loops++) {   // 90 s unless it turned out to be the touchpad
 		uint32_t cause;
 		if (!(rd(THC_M_PRT_READ_DMA_INT_STS_1_OFFSET) & NONDMA_STS)) { IOSleep(2); continue; }
 		cause = rd(THC_M_PRT_DEV_INT_CAUSE_REG_VAL_OFFSET);
@@ -438,6 +526,7 @@ void SurfaceTHCProbe::listen() {
 		count++;
 		const uint8_t *b = (const uint8_t *)buf;
 		// HIDSPI body: [type][len lo][len hi][report id][content...]; touchpad mouse report = id 0x80, 3 bytes
+		if (!e && b[0] == 1 && b[3] == 0x81 && got >= 33) handlePtp(b + 4, got - 4);
 		if (!e && b[0] == 1 && b[3] == 0x80 && got >= 7) {
 			if (!mouse) {
 				SurfaceTHCMouse *m = OSTypeAlloc(SurfaceTHCMouse);
