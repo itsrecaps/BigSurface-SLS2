@@ -208,7 +208,7 @@ void SurfaceTHCProbe::bringUp(IOACPIPlatformDevice *acpi) {
 	uint32_t rmode = (iom >> SPI_IO_MODE_SHIFT) & 3;
 	uint32_t wmode = (iom & SPI_WRITE_IO_MODE) ? rmode : 0;
 	uint8_t div = freqDiv(freq);
-	const uint32_t mps = 4;   // DEFAULT_MIN_PACKET_SIZE_VALUE
+	const uint32_t mps = 0x80;   // ithc: 0x80 unless ACPI limit_packet_size == 1
 	note("ctrl-before", rd(THC_M_PRT_CONTROL_OFFSET));
 	note("spicfg-before", rd(THC_M_PRT_SPI_CFG_OFFSET));
 
@@ -234,15 +234,15 @@ void SurfaceTHCProbe::bringUp(IOACPIPlatformDevice *acpi) {
 	wbits(THC_M_PRT_SPI_CFG_OFFSET,
 	      THC_M_PRT_SPI_CFG_SPI_TCRF | THC_M_PRT_SPI_CFG_SPI_TRMODE | THC_M_PRT_SPI_CFG_SPI_LOW_FREQ_EN | THC_M_PRT_SPI_CFG_SPI_RD_MPS |
 	      THC_M_PRT_SPI_CFG_SPI_TCWF | THC_M_PRT_SPI_CFG_SPI_TWMODE | THC_M_PRT_SPI_CFG_SPI_WR_MPS,
-	      ((uint32_t)div << 4) | (rmode << 2) | (mps << 7) | ((uint32_t)div << 20) | (wmode << 18) | (mps << 24));
-	auto opc = [](uint32_t mode, uint32_t op) -> uint32_t { return mode == 2 ? (op << 8) : mode == 1 ? (op << 16) : (op << 24); };
-	// QIO opcode field 15:8, DIO 23:16, SIO 31:24
+	      ((uint32_t)div << 4) | (rmode << 2) | (mps << 7) | ((uint32_t)div << 20) | (wmode << 18) | ((mps & 0xFF) << 24));
+	// ADL opcode layout (from linux-surface ithc): 0x1014 = RX, 0x1018 = TX, 0x101C unused.
+	// Each register holds the same opcode in its header/quad/dual/single bytes.
+	auto opc = [](uint32_t, uint32_t op) -> uint32_t { return op * 0x01010101u; };
 	wr(THC_M_PRT_SPI_ICRRD_OPCODE_OFFSET, opc(rmode, rop));
-	wr(THC_M_PRT_SPI_DMARD_OPCODE_OFFSET, opc(rmode, rop));
-	wr(THC_M_PRT_SPI_WR_OPCODE_OFFSET, opc(wmode, wop));
+	wr(THC_M_PRT_SPI_DMARD_OPCODE_OFFSET, opc(wmode, wop));
+	note("txop-after", rd(THC_M_PRT_SPI_DMARD_OPCODE_OFFSET));
 	note("spicfg-after", rd(THC_M_PRT_SPI_CFG_OFFSET));
 	note("rdop-after", rd(THC_M_PRT_SPI_ICRRD_OPCODE_OFFSET));
-	note("wrop-after", rd(THC_M_PRT_SPI_WR_OPCODE_OFFSET));
 	// 5. interrupt config (status only, global interrupt left OFF: we poll)
 	wbits(THC_M_PRT_INT_STATUS_OFFSET, THC_M_PRT_INT_STATUS_TXN_ERR_INT_STS | THC_M_PRT_INT_STATUS_FATAL_ERR_INT_STS, 0xFFFFFFFF);
 	wbits(THC_M_PRT_SW_SEQ_STS_OFFSET, THC_M_PRT_SW_SEQ_STS_THC_SS_ERR | THC_M_PRT_SW_SEQ_STS_TSSDONE, 0xFFFFFFFF);
@@ -265,6 +265,9 @@ void SurfaceTHCProbe::bringUp(IOACPIPlatformDevice *acpi) {
 	      (THC_UNIT_MICROFRAME_SIZE << __builtin_ctz(THC_M_PRT_DEVINT_CFG_2_THC_M_PRT_UFSIZE_UNIT)) |
 	      THC_M_PRT_DEVINT_CFG_2_THC_M_PRT_FTYPE_IGNORE | THC_M_PRT_DEVINT_CFG_2_THC_M_PRT_FTYPE_VAL);
 
+	wbits(THC_M_PRT_DEVINT_CFG_2_OFFSET, BIT(24) | BIT(25) | BIT(27), 0);
+	note("cfg1", rd(THC_M_PRT_DEVINT_CFG_1_OFFSET)); note("cfg2", rd(THC_M_PRT_DEVINT_CFG_2_OFFSET));
+
 	// 6. reset the touch IC through ACPI, then unquiesce and wait for RESET_RESPONSE
 	IOReturn rr = acpi->evaluateObject("_RST");
 	note("acpi-rst", rr);
@@ -283,36 +286,21 @@ void SurfaceTHCProbe::bringUp(IOACPIPlatformDevice *acpi) {
 	note("reset-pio", (uint64_t)(int64_t)e); noteBytes("reset-body", buf, got > 64 ? 64 : got);
 
 	// 7. DEVICE_DESCRIPTOR request: output header {type=1, len=0, id=0}
-	// Round 1 showed WR_OPCODE reads back 0 after writing it in the QIO field, so log what
-	// each layout reads back and try a few write modes until the device answers.
-	{
-		static const uint32_t probes[] = {0xE2u << 8, 0xE2u << 24, 0xE2u, 0xE2u << 16, 0xE2E2E2E2u};
-		OSArray *rb = OSArray::withCapacity(5);
-		for (uint32_t p : probes) {
-			wr(THC_M_PRT_SPI_WR_OPCODE_OFFSET, p);
-			OSNumber *n = OSNumber::withNumber(rd(THC_M_PRT_SPI_WR_OPCODE_OFFSET), 32);
-			if (rb && n) rb->setObject(n);
-			OSSafeReleaseNULL(n);
-		}
-		if (rb) { log->setObject("wrop-readback", rb); rb->release(); }
-	}
 	struct Try { uint32_t mode, op, reg; };
-	const Try tries[] = {
-		{wmode, wop, opc(wmode, wop)},
-	};
+	const Try tries[] = { {wmode, wop, opc(wmode, wop)} };
 	irq = false;
 	OSArray *att = OSArray::withCapacity(4);
 	note("dmard-op", rd(THC_M_PRT_SPI_DMARD_OPCODE_OFFSET));
 	for (unsigned t = 0; t < 1 && !irq; t++) {
 		wbits(THC_M_PRT_SPI_CFG_OFFSET, THC_M_PRT_SPI_CFG_SPI_TWMODE, tries[t].mode << 18);
-		wr(THC_M_PRT_SPI_WR_OPCODE_OFFSET, tries[t].reg);
+		wr(THC_M_PRT_SPI_DMARD_OPCODE_OFFSET, tries[t].reg);
 		wr(THC_M_PRT_READ_DMA_INT_STS_1_OFFSET, NONDMA_INT_STS_BIT);
 		uint32_t req = 0x00000001;
 		e = pioWrite(out, 4, &req);
 		irq = (e == 0) && waitNonDmaInt(1500, &cause);
 		char msg[96];
 		snprintf(msg, sizeof(msg), "try%u mode%u op0x%x reg0x%x rb0x%x pio%d irq%d cause0x%x", t, tries[t].mode, tries[t].op,
-		         tries[t].reg, rd(THC_M_PRT_SPI_WR_OPCODE_OFFSET), e, irq, cause);
+		         tries[t].reg, rd(THC_M_PRT_SPI_DMARD_OPCODE_OFFSET), e, irq, cause);
 		OSString *m = OSString::withCString(msg);
 		if (att && m) att->setObject(m);
 		OSSafeReleaseNULL(m);
