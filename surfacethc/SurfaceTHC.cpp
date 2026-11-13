@@ -14,6 +14,8 @@
 #include <libkern/c++/OSString.h>
 #include <libkern/c++/OSArray.h>
 #include "intel-thc-hw.h"
+#include <IOKit/hid/IOHIDDevice.h>
+#include <IOKit/IOBufferMemoryDescriptor.h>
 #include <kern/thread.h>
 #include <pexpert/pexpert.h>
 #include <mach/mach_time.h>
@@ -29,6 +31,7 @@ private:
 	volatile bool listening {false}, stopping {false};
 	char acpiName[8] {0};
 	IOACPIPlatformDevice *acpiDev {nullptr};
+	IOService *mouse {nullptr};
 	static bool checkThcTest() { int v = 0; return PE_parse_boot_argn("-thctest", &v, sizeof(v)); }
 	static void listenEntry(void *arg, wait_result_t);
 	void listen();
@@ -52,6 +55,51 @@ private:
 };
 
 OSDefineMetaClassAndStructors(SurfaceTHCProbe, IOService)
+
+// ---------- SurfaceTHCMouse: the touchpad's built-in mouse collection (report id 0x80) ----------
+// Until a precision-touchpad driver switches it to multitouch mode, the SLS2 touchpad sends plain
+// relative mouse reports: [buttons][dx int8][dy int8]. Expose that as a standard HID mouse.
+class SurfaceTHCMouse : public IOHIDDevice {
+	OSDeclareDefaultStructors(SurfaceTHCMouse)
+public:
+	IOReturn newReportDescriptor(IOMemoryDescriptor **desc) const override;
+	OSString *newTransportString() const override { return OSString::withCString("SPI"); }
+	OSString *newProductString() const override { return OSString::withCString("Surface Touchpad (THC)"); }
+	OSString *newManufacturerString() const override { return OSString::withCString("Microsoft"); }
+	OSNumber *newVendorIDNumber() const override { return OSNumber::withNumber(0x045E, 32); }
+	OSNumber *newProductIDNumber() const override { return OSNumber::withNumber(0x0C46, 32); }
+	OSNumber *newPrimaryUsagePageNumber() const override { return OSNumber::withNumber(0x01, 32); }
+	OSNumber *newPrimaryUsageNumber() const override { return OSNumber::withNumber(0x02, 32); }
+	void send(const uint8_t *r3);
+private:
+	IOBufferMemoryDescriptor *buf {nullptr};
+	void free() override { OSSafeReleaseNULL(buf); IOHIDDevice::free(); }
+};
+OSDefineMetaClassAndStructors(SurfaceTHCMouse, IOHIDDevice)
+
+static const uint8_t kMouseDesc[] = {
+	0x05, 0x01, 0x09, 0x02, 0xA1, 0x01, 0x09, 0x01, 0xA1, 0x00,
+	0x05, 0x09, 0x19, 0x01, 0x29, 0x03, 0x15, 0x00, 0x25, 0x01, 0x95, 0x03, 0x75, 0x01, 0x81, 0x02,
+	0x95, 0x01, 0x75, 0x05, 0x81, 0x03,
+	0x05, 0x01, 0x09, 0x30, 0x09, 0x31, 0x15, 0x81, 0x25, 0x7F, 0x75, 0x08, 0x95, 0x02, 0x81, 0x06,
+	0xC0, 0xC0,
+};
+
+IOReturn SurfaceTHCMouse::newReportDescriptor(IOMemoryDescriptor **desc) const {
+	IOBufferMemoryDescriptor *b = IOBufferMemoryDescriptor::withBytes(kMouseDesc, sizeof(kMouseDesc), kIODirectionNone);
+	if (!b) return kIOReturnNoMemory;
+	*desc = b;
+	return kIOReturnSuccess;
+}
+
+void SurfaceTHCMouse::send(const uint8_t *r3) {
+	if (!buf) buf = IOBufferMemoryDescriptor::withCapacity(3, kIODirectionNone);
+	if (!buf) return;
+	buf->setLength(3);
+	buf->writeBytes(0, r3, 3);
+	handleReport(buf, kIOHIDReportTypeInput);
+}
+
 
 // ACPI ToUUID byte order
 static const uint8_t kHidSpiGuid[16]   = {0x36,0xc4,0x2a,0x6e, 0xcf,0x0f, 0xaf,0x41, 0xa2,0x65, 0xb3,0x2a,0x22,0x0d,0xcf,0xab};
@@ -351,7 +399,7 @@ void SurfaceTHCProbe::listen() {
 	OSArray *first = OSArray::withCapacity(16);
 	OSDictionary *types = OSDictionary::withCapacity(8);
 	char key[16];
-	for (uint32_t loops = 0; !stopping && loops < 45000; loops++) {   // ~90 s at 2 ms
+	for (uint32_t loops = 0; !stopping && (mouse || loops < 45000); loops++) {   // 90 s unless it turned out to be the touchpad
 		uint32_t cause;
 		if (!(rd(THC_M_PRT_READ_DMA_INT_STS_1_OFFSET) & NONDMA_STS)) { IOSleep(2); continue; }
 		cause = rd(THC_M_PRT_DEV_INT_CAUSE_REG_VAL_OFFSET);
@@ -361,6 +409,17 @@ void SurfaceTHCProbe::listen() {
 		if (e) readErr++;
 		count++;
 		const uint8_t *b = (const uint8_t *)buf;
+		// HIDSPI body: [type][len lo][len hi][report id][content...]; touchpad mouse report = id 0x80, 3 bytes
+		if (!e && b[0] == 1 && b[3] == 0x80 && got >= 7) {
+			if (!mouse) {
+				SurfaceTHCMouse *m = OSTypeAlloc(SurfaceTHCMouse);
+				if (m && m->init() && m->attach(this)) {
+					if (m->start(this)) { mouse = m; IOLog("SurfaceTHC: %s touchpad mouse online\n", acpiName); }
+					else { m->detach(this); m->release(); }
+				} else OSSafeReleaseNULL(m);
+			}
+			if (mouse) static_cast<SurfaceTHCMouse *>(mouse)->send(b + 4);
+		}
 		snprintf(key, sizeof(key), "type%u", b[0]);
 		OSNumber *old = OSDynamicCast(OSNumber, types->getObject(key));
 		OSNumber *nn = OSNumber::withNumber((old ? old->unsigned32BitValue() : 0) + 1, 32);
@@ -374,7 +433,7 @@ void SurfaceTHCProbe::listen() {
 			if (str) { first->setObject(str); str->release(); }
 			if (first->getCount() == 1) IOLog("SurfaceTHC: %s first report: %s\n", acpiName, line);
 		}
-		if (count == 1 || (count % 50) == 0) {
+		if (count == 1 || (count % 500) == 0) {
 			OSDictionary *d = OSDictionary::withCapacity(4);
 			if (d) {
 				setNum2(d, "reports", count); setNum2(d, "read-errors", readErr);
@@ -480,6 +539,7 @@ bool SurfaceTHCProbe::start(IOService *provider) {
 void SurfaceTHCProbe::stop(IOService *provider) {
 	stopping = true;
 	for (int i = 0; i < 100 && listening; i++) IOSleep(10);
+	if (mouse) { mouse->stop(this); mouse->detach(this); OSSafeReleaseNULL(mouse); }
 	OSSafeReleaseNULL(map);
 	IOService::stop(provider);
 }
