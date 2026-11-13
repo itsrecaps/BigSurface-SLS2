@@ -1,0 +1,22 @@
+name: Build SurfaceTHC (touchpad probe)
+
+on:
+  push:
+    paths: ['surfacethc/**', '.github/workflows/surfacethc.yml']
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: |
+          zsh surfacethc/build.sh
+          file surfacethc/build/SurfaceTHC.kext/Contents/MacOS/SurfaceTHC
+          nm surfacethc/build/SurfaceTHC.kext/Contents/MacOS/SurfaceTHC | grep -i "SurfaceTHCProbe" | head -5
+          mkdir -p out && ditto surfacethc/build/SurfaceTHC.kext out/SurfaceTHC.kext
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SurfaceTHC
+          path: out/
