@@ -14,6 +14,8 @@
 #include <libkern/c++/OSString.h>
 #include <libkern/c++/OSArray.h>
 #include "intel-thc-hw.h"
+#include <kern/thread.h>
+#include <mach/mach_time.h>
 
 class SurfaceTHCProbe : public IOService {
 	OSDeclareDefaultStructors(SurfaceTHCProbe)
@@ -22,6 +24,11 @@ public:
 	void stop(IOService *provider) override;
 private:
 	IOMemoryMap *map {nullptr};
+	uint32_t bodyAddr {0};
+	volatile bool listening {false}, stopping {false};
+	char acpiName[8] {0};
+	static void listenEntry(void *arg, wait_result_t);
+	void listen();
 	void readDSM(IOACPIPlatformDevice *acpi, const char *name, const uint8_t *uuid, uint32_t rev, uint32_t maxFunc);
 	uint64_t dsmInt(IOACPIPlatformDevice *acpi, const uint8_t *uuid, uint32_t func, bool *ok);
 	uint32_t rd(uint32_t off) { return *reinterpret_cast<volatile uint32_t *>(map->getVirtualAddress() + off); }
@@ -268,6 +275,8 @@ void SurfaceTHCProbe::bringUp(IOACPIPlatformDevice *acpi) {
 	note("int-status", rd(THC_M_PRT_INT_STATUS_OFFSET));
 	note("err-cause", rd(THC_M_PRT_ERR_CAUSE_OFFSET));
 	if (!irq) { noteStr("result", "no RESET_RESPONSE interrupt"); goto done; }
+	listening = true;   // the touch IC answered, so after this we keep listening for touch reports
+	bodyAddr = bdy;
 	uint32_t len = ((cause >> 8) & 0x3FFF) * 4;
 	note("reset-len", len);
 	int e = pioRead(bdy, len ? len : 4, buf, &got);
@@ -290,13 +299,11 @@ void SurfaceTHCProbe::bringUp(IOACPIPlatformDevice *acpi) {
 	struct Try { uint32_t mode, op, reg; };
 	const Try tries[] = {
 		{wmode, wop, opc(wmode, wop)},
-		{wmode, wop, 0xE2E2E2E2u},
-		{0, wop, wop << 24},
-		{0, 0x02, 0x02u << 24},
 	};
 	irq = false;
 	OSArray *att = OSArray::withCapacity(4);
-	for (unsigned t = 0; t < 4 && !irq; t++) {
+	note("dmard-op", rd(THC_M_PRT_SPI_DMARD_OPCODE_OFFSET));
+	for (unsigned t = 0; t < 1 && !irq; t++) {
 		wbits(THC_M_PRT_SPI_CFG_OFFSET, THC_M_PRT_SPI_CFG_SPI_TWMODE, tries[t].mode << 18);
 		wr(THC_M_PRT_SPI_WR_OPCODE_OFFSET, tries[t].reg);
 		wr(THC_M_PRT_READ_DMA_INT_STS_1_OFFSET, NONDMA_INT_STS_BIT);
@@ -330,12 +337,75 @@ void SurfaceTHCProbe::bringUp(IOACPIPlatformDevice *acpi) {
 	}
 done:
 	note("ctrl-after", rd(THC_M_PRT_CONTROL_OFFSET));
-	// leave the controller quiet again
-	wbits(THC_M_PRT_CONTROL_OFFSET, THC_M_PRT_CONTROL_THC_DEVINT_QUIESCE_EN, THC_M_PRT_CONTROL_THC_DEVINT_QUIESCE_EN);
+	if (!listening)   // leave the controller quiet again
+		wbits(THC_M_PRT_CONTROL_OFFSET, THC_M_PRT_CONTROL_THC_DEVINT_QUIESCE_EN, THC_M_PRT_CONTROL_THC_DEVINT_QUIESCE_EN);
 	setProperty("THC-bringup", log);
 	if (OSString *r = OSDynamicCast(OSString, log->getObject("result")))
 		IOLog("SurfaceTHC: %s bring-up: %s\n", acpi->getName(), r->getCStringNoCopy());
 	OSSafeReleaseNULL(log);
+}
+
+// ---------- listen mode: poll for touch reports for 10 minutes and record what arrives ----------
+void SurfaceTHCProbe::listenEntry(void *arg, wait_result_t) {
+	SurfaceTHCProbe *self = static_cast<SurfaceTHCProbe *>(arg);
+	self->listen();
+	self->release();
+	thread_terminate(current_thread());
+}
+
+void SurfaceTHCProbe::listen() {
+	uint64_t t0 = mach_absolute_time(), freq_ns;
+	absolutetime_to_nanoseconds(1, &freq_ns);
+	uint32_t count = 0, readErr = 0;
+	OSArray *first = OSArray::withCapacity(16);
+	OSDictionary *types = OSDictionary::withCapacity(8);
+	char key[16];
+	for (uint32_t loops = 0; !stopping && loops < 300000; loops++) {   // ~10 min at 2 ms
+		uint32_t cause;
+		if (!(rd(THC_M_PRT_READ_DMA_INT_STS_1_OFFSET) & NONDMA_STS)) { IOSleep(2); continue; }
+		cause = rd(THC_M_PRT_DEV_INT_CAUSE_REG_VAL_OFFSET);
+		wr(THC_M_PRT_READ_DMA_INT_STS_1_OFFSET, NONDMA_INT_STS_BIT);
+		uint32_t len = ((cause >> 8) & 0x3FFF) * 4, got = 0, buf[16] = {0};
+		int e = pioRead(bodyAddr, len == 0 ? 4 : (len > 64 ? 64 : len), buf, &got);
+		if (e) readErr++;
+		count++;
+		const uint8_t *b = (const uint8_t *)buf;
+		snprintf(key, sizeof(key), "type%u", b[0]);
+		OSNumber *old = OSDynamicCast(OSNumber, types->getObject(key));
+		OSNumber *nn = OSNumber::withNumber((old ? old->unsigned32BitValue() : 0) + 1, 32);
+		if (nn) { types->setObject(key, nn); nn->release(); }
+		if (first && first->getCount() < 16) {
+			char line[200];
+			uint64_t ms = (mach_absolute_time() - t0) / 1000000;
+			int n = snprintf(line, sizeof(line), "t+%llums cause0x%08x len%u pio%d:", ms, cause, len, e);
+			for (uint32_t i = 0; i < 40 && i < got && n < (int)sizeof(line) - 4; i++) n += snprintf(line + n, sizeof(line) - n, " %02x", b[i]);
+			OSString *str = OSString::withCString(line);
+			if (str) { first->setObject(str); str->release(); }
+			if (first->getCount() == 1) IOLog("SurfaceTHC: %s first report: %s\n", acpiName, line);
+		}
+		if (count == 1 || (count % 50) == 0) {
+			OSDictionary *d = OSDictionary::withCapacity(4);
+			if (d) {
+				setNum2(d, "reports", count); setNum2(d, "read-errors", readErr);
+				if (first) d->setObject("first", first);
+				d->setObject("by-type", types);
+				setProperty("THC-listen", d); d->release();
+			}
+		}
+	}
+	OSDictionary *d = OSDictionary::withCapacity(4);
+	if (d) {
+		setNum2(d, "reports", count); setNum2(d, "read-errors", readErr);
+		if (first) d->setObject("first", first);
+		if (types) d->setObject("by-type", types);
+		OSString *st = OSString::withCString(stopping ? "stopped" : "finished 10 min window");
+		if (st) { d->setObject("state", st); st->release(); }
+		setProperty("THC-listen", d); d->release();
+	}
+	OSSafeReleaseNULL(first); OSSafeReleaseNULL(types);
+	wbits(THC_M_PRT_CONTROL_OFFSET, THC_M_PRT_CONTROL_THC_DEVINT_QUIESCE_EN, THC_M_PRT_CONTROL_THC_DEVINT_QUIESCE_EN);
+	listening = false;
+	IOLog("SurfaceTHC: %s listen done, %u reports\n", acpiName, count);
 }
 
 bool SurfaceTHCProbe::start(IOService *provider) {
@@ -387,7 +457,16 @@ bool SurfaceTHCProbe::start(IOService *provider) {
 
 	if (map && acpi && map->getLength() >= 0x1400) {
 		pci->setBusMasterEnable(false);
+		strlcpy(acpiName, acpi->getName(), sizeof(acpiName));
 		bringUp(acpi);
+		if (listening) {
+			OSDictionary *d = OSDictionary::withCapacity(1);
+			if (d) { OSString *st = OSString::withCString("waiting for touches"); if (st) { d->setObject("state", st); st->release(); } setProperty("THC-listen", d); d->release(); }
+			thread_t th;
+			retain();
+			if (kernel_thread_start(&SurfaceTHCProbe::listenEntry, this, &th) == KERN_SUCCESS) thread_deallocate(th);
+			else { release(); listening = false; }
+		}
 	}
 	IOLog("SurfaceTHC: probe done on %s\n", provider->getName());
 	registerService();
@@ -395,6 +474,8 @@ bool SurfaceTHCProbe::start(IOService *provider) {
 }
 
 void SurfaceTHCProbe::stop(IOService *provider) {
+	stopping = true;
+	for (int i = 0; i < 100 && listening; i++) IOSleep(10);
 	OSSafeReleaseNULL(map);
 	IOService::stop(provider);
 }
