@@ -15,8 +15,8 @@ Running **macOS Tahoe 26.7.1 (25G241)** with OpenCore 1.0.8, based on
 | USB | Works with the custom USBToolBox map (UTBMap.kext) |
 | Wifi | Works on WPA2 personal (AirportItlwm). School WPA2 Enterprise not working yet |
 | Bluetooth | Kexts in, not tested |
-| Keyboard | Not working. Fix built (`patches/`, BigSurface with SLS2 UART), not installed yet |
-| Battery % | Not working. Should come with BigSurface (same Surface SAM chip as the keyboard) |
+| Keyboard | Working. BigSurface + SSDT-SSH + TigerLake GPIO, SAM HID on TID 1 |
+| Battery % | Working. BigSurface battery driver (SMCBatteryManager must be off) |
 | Touchpad | Not working. No macOS driver exists. Started one: `surfacethc/` (read only probe so far) |
 | Audio | Not working. Tahoe dropped AppleHDA, needs the AppleHDA root patch + AppleALC layout 35 |
 | Sleep | Probably impossible, firmware only has S4/S5 (no S3) |
