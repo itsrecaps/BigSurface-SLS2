@@ -15,6 +15,7 @@
 #include <libkern/c++/OSArray.h>
 #include "intel-thc-hw.h"
 #include <kern/thread.h>
+#include <pexpert/pexpert.h>
 #include <mach/mach_time.h>
 
 class SurfaceTHCProbe : public IOService {
@@ -27,6 +28,8 @@ private:
 	uint32_t bodyAddr {0};
 	volatile bool listening {false}, stopping {false};
 	char acpiName[8] {0};
+	IOACPIPlatformDevice *acpiDev {nullptr};
+	static bool checkThcTest() { int v = 0; return PE_parse_boot_argn("-thctest", &v, sizeof(v)); }
 	static void listenEntry(void *arg, wait_result_t);
 	void listen();
 	void readDSM(IOACPIPlatformDevice *acpi, const char *name, const uint8_t *uuid, uint32_t rev, uint32_t maxFunc);
@@ -348,7 +351,7 @@ void SurfaceTHCProbe::listen() {
 	OSArray *first = OSArray::withCapacity(16);
 	OSDictionary *types = OSDictionary::withCapacity(8);
 	char key[16];
-	for (uint32_t loops = 0; !stopping && loops < 300000; loops++) {   // ~10 min at 2 ms
+	for (uint32_t loops = 0; !stopping && loops < 45000; loops++) {   // ~90 s at 2 ms
 		uint32_t cause;
 		if (!(rd(THC_M_PRT_READ_DMA_INT_STS_1_OFFSET) & NONDMA_STS)) { IOSleep(2); continue; }
 		cause = rd(THC_M_PRT_DEV_INT_CAUSE_REG_VAL_OFFSET);
@@ -386,12 +389,17 @@ void SurfaceTHCProbe::listen() {
 		setNum2(d, "reports", count); setNum2(d, "read-errors", readErr);
 		if (first) d->setObject("first", first);
 		if (types) d->setObject("by-type", types);
-		OSString *st = OSString::withCString(stopping ? "stopped" : "finished 10 min window");
+		OSString *st = OSString::withCString(stopping ? "stopped" : "finished 90 s window");
 		if (st) { d->setObject("state", st); st->release(); }
 		setProperty("THC-listen", d); d->release();
 	}
 	OSSafeReleaseNULL(first); OSSafeReleaseNULL(types);
+	// Put everything back: quiesce, wait for the THC to go idle, and reset the touch IC again so
+	// it is in the same state the firmware left it (round 0.3 left it running and hung a reboot).
 	wbits(THC_M_PRT_CONTROL_OFFSET, THC_M_PRT_CONTROL_THC_DEVINT_QUIESCE_EN, THC_M_PRT_CONTROL_THC_DEVINT_QUIESCE_EN);
+	pollBits(THC_M_PRT_CONTROL_OFFSET, THC_M_PRT_CONTROL_THC_DEVINT_QUIESCE_HW_STS, THC_M_PRT_CONTROL_THC_DEVINT_QUIESCE_HW_STS, 1000);
+	if (acpiDev) acpiDev->evaluateObject("_RST");
+	wr(THC_M_PRT_READ_DMA_INT_STS_1_OFFSET, NONDMA_INT_STS_BIT);
 	listening = false;
 	IOLog("SurfaceTHC: %s listen done, %u reports\n", acpiName, count);
 }
@@ -442,10 +450,13 @@ bool SurfaceTHCProbe::start(IOService *provider) {
 	} else {
 		setProperty("THC-bar0-length", "map failed");
 	}
+	if (!checkThcTest()) setProperty("THC-bringup", "skipped (no -thctest boot-arg)");
 
-	if (map && acpi && map->getLength() >= 0x1400) {
+	// Only touch the controller when the -thctest boot-arg is set, so a normal boot is read-only.
+	if (map && acpi && map->getLength() >= 0x1400 && checkThcTest()) {
 		pci->setBusMasterEnable(false);
 		strlcpy(acpiName, acpi->getName(), sizeof(acpiName));
+		acpiDev = acpi;
 		bringUp(acpi);
 		if (listening) {
 			OSDictionary *d = OSDictionary::withCapacity(1);
