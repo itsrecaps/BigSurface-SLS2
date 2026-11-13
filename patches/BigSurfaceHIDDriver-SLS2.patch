@@ -1,0 +1,25 @@
+diff --git a/BigSurfaceHIDDriver/SurfaceHIDDriver.cpp b/BigSurfaceHIDDriver/SurfaceHIDDriver.cpp
+index 98eea99..418cefc 100644
+--- a/BigSurfaceHIDDriver/SurfaceHIDDriver.cpp
++++ b/BigSurfaceHIDDriver/SurfaceHIDDriver.cpp
+@@ -24,7 +24,7 @@ void SurfaceHIDDriver::eventReceived(SurfaceHIDNub *sender, SurfaceHIDDeviceType
+             kbd_interrupt->interruptOccurred(nullptr, this, 0);
+             break;
+         case SurfaceTouchpadDevice:
+-            if (!legacy) {
++            if (!legacy && touchpad && tpd_interrupt) {
+                 tpd_report->setLength(len);
+                 tpd_report->writeBytes(0, buffer, len);
+                 tpd_interrupt->interruptOccurred(nullptr, this, 0);
+@@ -106,7 +106,10 @@ bool SurfaceHIDDriver::start(IOService *provider) {
+     work_loop->addEventSource(kbd_interrupt);
+     kbd_interrupt->enable();
+ 
+-    if (!legacy) {
++    SurfaceHIDDescriptor tp_desc;
++    if (!legacy && getHIDDescriptor(SurfaceTouchpadDevice, &tp_desc) != kIOReturnSuccess)
++        LOG("No SAM touchpad (Surface Laptop Studio 2 uses THC), keyboard only");
++    else if (!legacy) {
+         touchpad = OSTypeAlloc(SurfaceHIDDevice);
+         if (!touchpad) {
+             LOG("Could not create touchpad device");

@@ -20,6 +20,7 @@ jobs:
           git apply ../patches/BigSurface-SLS2.patch
           (cd Dependencies/VoodooSerial && git apply ../../../patches/VoodooSerial-SLS2.patch)
           (cd Dependencies/VoodooGPIO && git apply ../../../patches/VoodooGPIO-TigerLake.patch)
+          (cd Dependencies/BigSurfaceHIDDriver && git apply ../../../patches/BigSurfaceHIDDriver-SLS2.patch)
 
       - name: Get Lilu and VirtualSMC SDK (DEBUG builds)
         env:

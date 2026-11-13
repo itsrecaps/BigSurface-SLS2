@@ -1,18 +1,123 @@
+diff --git a/BigSurface/BigSurface/SurfaceSerialHub/SurfaceSerialHubDriver.cpp b/BigSurface/BigSurface/SurfaceSerialHub/SurfaceSerialHubDriver.cpp
+index 54d2648..732e396 100644
+--- a/BigSurface/BigSurface/SurfaceSerialHub/SurfaceSerialHubDriver.cpp
++++ b/BigSurface/BigSurface/SurfaceSerialHub/SurfaceSerialHubDriver.cpp
+@@ -22,6 +22,7 @@ static const SurfaceSerialEventRegistryConfig event_conf[] = {
+     {SSH_TC_SAM, SSH_TID_PRIMARY, SSH_CID_SAM_ENABLE_EVENT, SSH_CID_SAM_DISABLE_EVENT},
+     {SSH_TC_REG, SSH_TID_SECONDARY, SSH_CID_REG_ENABLE_EVENT, SSH_CID_REG_DISABLE_EVENT},
+     {SSH_TC_KIP, SSH_TID_SECONDARY, SSH_CID_KIP_ENABLE_EVENT, SSH_CID_KIP_DISABLE_EVENT},
++    {SSH_TC_REG, SSH_TID_PRIMARY, SSH_CID_REG_ENABLE_EVENT, SSH_CID_REG_DISABLE_EVENT},
+ };
+ 
+ OSDefineMetaClassAndAbstractStructors(SurfaceSerialHubClient, IOService);
+diff --git a/BigSurface/BigSurface/SurfaceSerialHub/SurfaceSerialHubDriver.hpp b/BigSurface/BigSurface/SurfaceSerialHub/SurfaceSerialHubDriver.hpp
+index c6d4af0..fbceaaa 100644
+--- a/BigSurface/BigSurface/SurfaceSerialHub/SurfaceSerialHubDriver.hpp
++++ b/BigSurface/BigSurface/SurfaceSerialHub/SurfaceSerialHubDriver.hpp
+@@ -19,6 +19,7 @@ enum SurfaceSerialEventRegistryType {
+     SurfaceSerialEventHostManagedV1 = 0,
+     SurfaceSerialEventHostManagedV2,
+     SurfaceSerialEventHubManaged,
++    SurfaceSerialEventHostManagedV2Sam,   // REG registry on TID 1 (SLS1/SLS2 SAM HID)
+     SurfaceSerialEventTypeCount
+ };
+ 
 diff --git a/BigSurface/BigSurface/SurfaceSerialHubDevices/SurfaceHIDNub.cpp b/BigSurface/BigSurface/SurfaceSerialHubDevices/SurfaceHIDNub.cpp
-index a7c5d49..d89c80c 100644
+index a7c5d49..e2e2f3b 100644
 --- a/BigSurface/BigSurface/SurfaceSerialHubDevices/SurfaceHIDNub.cpp
 +++ b/BigSurface/BigSurface/SurfaceSerialHubDevices/SurfaceHIDNub.cpp
-@@ -74,8 +74,11 @@ IOReturn SurfaceHIDNub::registerHIDEvent(OSObject* owner, EventHandler _handler)
+@@ -36,10 +36,17 @@ bool SurfaceHIDNub::start(IOService *provider) {
+     SurfaceHIDDescriptor desc;
+     if (getHIDDescriptor(SurfaceLegacyKeyboardDevice, &desc) != kIOReturnSuccess) {
+         legacy = false;
+-        if (getHIDDescriptor(SurfaceKeyboardDevice, &desc) != kIOReturnSuccess)
+-            return false;
++        hid_tid = SSH_TID_PRIMARY;   // Laptop Studio 1/2: keyboard is SAM HID, TID 1
++        if (getHIDDescriptor(SurfaceKeyboardDevice, &desc) != kIOReturnSuccess) {
++            hid_tid = SSH_TID_SECONDARY;
++            if (getHIDDescriptor(SurfaceKeyboardDevice, &desc) != kIOReturnSuccess) {
++                LOG("No SAM keyboard found on TID 1 or 2");
++                return false;
++            }
++        }
+     }
+-    LOG("HID version %d", !legacy+1);
++    LOG("HID version %d, tid %d", !legacy+1, hid_tid);
++    setProperty("HID-TID", hid_tid, 8);
+     setProperty(SURFACE_LEGACY_HID_STRING, legacy);
+     
+     PMinit();
+@@ -73,9 +80,12 @@ IOReturn SurfaceHIDNub::registerHIDEvent(OSObject* owner, EventHandler _handler)
+     if (legacy)
          ret = ssh->registerEvent(this, SurfaceSerialEventHostManagedV1, SSH_TC_KBD, SurfaceLegacyKeyboardDevice);
      else {
-         ret = ssh->registerEvent(this, SurfaceSerialEventHostManagedV2, SSH_TC_HID, SurfaceKeyboardDevice);
+-        ret = ssh->registerEvent(this, SurfaceSerialEventHostManagedV2, SSH_TC_HID, SurfaceKeyboardDevice);
 -        if (ret == kIOReturnSuccess)
 -            ret = ssh->registerEvent(this, SurfaceSerialEventHostManagedV2, SSH_TC_HID, SurfaceTouchpadDevice);
++        ret = ssh->registerEvent(this, hidRegistry(), SSH_TC_HID, SurfaceKeyboardDevice);
 +        // Surface Laptop Studio 2 has no SAM touchpad (it is on Intel THC), so a failed touchpad
 +        // registration must not take the keyboard down with it.
 +        if (ret == kIOReturnSuccess &&
-+            ssh->registerEvent(this, SurfaceSerialEventHostManagedV2, SSH_TC_HID, SurfaceTouchpadDevice) != kIOReturnSuccess)
++            ssh->registerEvent(this, hidRegistry(), SSH_TC_HID, SurfaceTouchpadDevice) != kIOReturnSuccess)
 +            LOG("No SAM touchpad, keyboard only");
      }
      if (ret != kIOReturnSuccess)
          return ret;
+@@ -92,8 +102,8 @@ void SurfaceHIDNub::unregisterHIDEvent(OSObject* owner) {
+         if (legacy)
+             ssh->unregisterEvent(this, SurfaceSerialEventHostManagedV1, SSH_TC_KBD, SurfaceLegacyKeyboardDevice);
+         else {
+-            ssh->unregisterEvent(this, SurfaceSerialEventHostManagedV2, SSH_TC_HID, SurfaceKeyboardDevice);
+-            ssh->unregisterEvent(this, SurfaceSerialEventHostManagedV2, SSH_TC_HID, SurfaceTouchpadDevice);
++            ssh->unregisterEvent(this, hidRegistry(), SSH_TC_HID, SurfaceKeyboardDevice);
++            ssh->unregisterEvent(this, hidRegistry(), SSH_TC_HID, SurfaceTouchpadDevice);
+         }
+         target = nullptr;
+         handler = nullptr;
+@@ -111,7 +121,7 @@ void SurfaceHIDNub::eventReceived(UInt8 tc, UInt8 tid, UInt8 iid, UInt8 cid, UIn
+         
+         device = SurfaceLegacyKeyboardDevice;
+     } else {
+-        if (cid != SSH_EVENT_CID_HID_INPUT || tid != SSH_TID_SECONDARY)
++        if (cid != SSH_EVENT_CID_HID_INPUT)
+             goto error;
+         
+         switch (iid) {
+@@ -176,7 +186,7 @@ IOReturn SurfaceHIDNub::getData(SurfaceHIDDeviceType device, SurfaceHIDDescripto
+         cache_as_buf->offset = offset;
+         cache_as_buf->length = length;
+ 
+-        if (ssh->getResponse(SSH_TC_HID, SSH_TID_SECONDARY, device, SSH_CID_HID_GET_DESCRIPTOR, cache, SURFACE_HID_DESC_HEADER_SIZE, true, cache, response_len) != kIOReturnSuccess) {
++        if (ssh->getResponse(SSH_TC_HID, hid_tid, device, SSH_CID_HID_GET_DESCRIPTOR, cache, SURFACE_HID_DESC_HEADER_SIZE, true, cache, response_len) != kIOReturnSuccess) {
+             LOG("Failed to get data from SSH!");
+             return kIOReturnError;
+         }
+@@ -226,13 +236,13 @@ IOReturn SurfaceHIDNub::getHIDRawReport(SurfaceHIDDeviceType device, UInt8 repor
+         memcpy(buffer, report, SURFACE_LEGACY_FEAT_REPORT_SIZE);
+         return kIOReturnSuccess;
+     } else
+-        return ssh->getResponse(SSH_TC_HID, SSH_TID_SECONDARY, device, SSH_CID_HID_GET_FEAT_REPORT, &report_id, 1, true, buffer, len);
++        return ssh->getResponse(SSH_TC_HID, hid_tid, device, SSH_CID_HID_GET_FEAT_REPORT, &report_id, 1, true, buffer, len);
+ }
+ 
+ void SurfaceHIDNub::setHIDRawReport(SurfaceHIDDeviceType device, UInt8 report_id, bool feature, UInt8 *buffer, UInt16 len) {
+     if (!legacy) {
+         UInt8 cid = feature ? SSH_CID_HID_SET_FEAT_REPORT : SSH_CID_HID_OUT_REPORT;
+         buffer[0] = report_id;
+-        ssh->sendCommand(SSH_TC_HID, SSH_TID_SECONDARY, device, cid, buffer, len, true);
++        ssh->sendCommand(SSH_TC_HID, hid_tid, device, cid, buffer, len, true);
+     }
+ }
+diff --git a/BigSurface/BigSurface/SurfaceSerialHubDevices/SurfaceHIDNub.hpp b/BigSurface/BigSurface/SurfaceSerialHubDevices/SurfaceHIDNub.hpp
+index 4af50c5..40b2cc9 100644
+--- a/BigSurface/BigSurface/SurfaceSerialHubDevices/SurfaceHIDNub.hpp
++++ b/BigSurface/BigSurface/SurfaceSerialHubDevices/SurfaceHIDNub.hpp
+@@ -92,6 +92,8 @@ private:
+     EventHandler            handler {nullptr};
+ 
+     bool    legacy {true};
++    UInt8   hid_tid {2};    // 2 = KIP (older Surfaces), 1 = SAM (Laptop Studio 1/2)
++    SurfaceSerialEventRegistryType hidRegistry() { return hid_tid == 1 ? SurfaceSerialEventHostManagedV2Sam : SurfaceSerialEventHostManagedV2; }
+ 
+     IOReturn getDescriptorData(SurfaceHIDDeviceType device, SurfaceHIDDescriptorEntryType entry, UInt8 *buffer, UInt16 buffer_len);
+     
