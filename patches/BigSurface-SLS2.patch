@@ -1,3 +1,56 @@
+diff --git a/BigSurface/BigSurface/SurfaceBattery/BatteryManager.cpp b/BigSurface/BigSurface/SurfaceBattery/BatteryManager.cpp
+index 8f089e7..66499e6 100644
+--- a/BigSurface/BigSurface/SurfaceBattery/BatteryManager.cpp
++++ b/BigSurface/BigSurface/SurfaceBattery/BatteryManager.cpp
+@@ -112,6 +112,13 @@ bool BatteryManager::updateAdapterStatus(UInt8 index, UInt32 psr) {
+ }
+ 
+ void BatteryManager::externalPowerNotify(bool status) {
++	// SLS2: only tell IOPMrootDomain when AC actually changes. Every call makes the root domain
++	// re-send a clamshell notification, and the poll loop called this up to twice a second,
++	// which made loginwindow/WindowServer re-evaluate the display constantly (lag spikes).
++	static int lastStatus = -1;
++	if (lastStatus == (int)status)
++		return;
++	lastStatus = (int)status;
+ 	IOPMrootDomain *rd = IOACPIPlatformDevice::getPMRootDomain();
+ 	rd->receivePowerNotification(kIOPMSetACAdaptorConnected | (kIOPMSetValue * status));
+ }
+diff --git a/BigSurface/BigSurface/SurfaceBattery/SurfaceBatteryDriver.cpp b/BigSurface/BigSurface/SurfaceBattery/SurfaceBatteryDriver.cpp
+index 4462ca4..f437ac2 100644
+--- a/BigSurface/BigSurface/SurfaceBattery/SurfaceBatteryDriver.cpp
++++ b/BigSurface/BigSurface/SurfaceBattery/SurfaceBatteryDriver.cpp
+@@ -106,6 +106,7 @@ void SurfaceBatteryDriver::updateBatteryStatus(IOInterruptEventSource *sender, i
+         BatteryManager::getShared()->informStatusChanged();
+     }
+ 
++    fail_cnt = 0;
+     if (quick_cnt) {
+         if (--quick_cnt == 0)
+             sync = true;    // after finishing quick update, sync with normal update
+@@ -130,7 +131,9 @@ void SurfaceBatteryDriver::updateBatteryStatus(IOInterruptEventSource *sender, i
+     }
+     return;
+ fail:
+-    timer->setTimeoutMS(BST_UPDATE_QUICK/2);
++    // SLS2: back off instead of hammering the SAM every 500 ms forever when a query fails.
++    if (fail_cnt < 10) fail_cnt++;
++    timer->setTimeoutMS(fail_cnt < 4 ? BST_UPDATE_QUICK/2 : BST_UPDATE_QUICK * 10);
+ }
+ 
+ void SurfaceBatteryDriver::pollBatteryStatus(IOTimerEventSource *sender) {
+diff --git a/BigSurface/BigSurface/SurfaceBattery/SurfaceBatteryDriver.hpp b/BigSurface/BigSurface/SurfaceBattery/SurfaceBatteryDriver.hpp
+index de1d453..ac61cef 100644
+--- a/BigSurface/BigSurface/SurfaceBattery/SurfaceBatteryDriver.hpp
++++ b/BigSurface/BigSurface/SurfaceBattery/SurfaceBatteryDriver.hpp
+@@ -95,6 +95,7 @@ private:
+     bool    awake {false};
+     bool    power_connected {true};
+     bool    bix_fail {true};
++    UInt8 fail_cnt {0};
+     int     quick_cnt {0};
+     bool    bat_missing {false};
+     bool    sync {false};
 diff --git a/BigSurface/BigSurface/SurfaceSerialHub/SurfaceSerialHubDriver.cpp b/BigSurface/BigSurface/SurfaceSerialHub/SurfaceSerialHubDriver.cpp
 index 54d2648..732e396 100644
 --- a/BigSurface/BigSurface/SurfaceSerialHub/SurfaceSerialHubDriver.cpp
