@@ -56,6 +56,7 @@ static int xeAuxBlMode() {
 }
 static bool xeAuxBlHdr() { return xeAuxBlMode() >= 3; }
 static void xeStatsPublish(thread_call_param_t, thread_call_param_t);  // SLS2 lag stats (defined at end of file)
+static void xeIrqHealthTick(IOService *svc);
 static thread_call_t gStatsTc = nullptr;
 static void xeTopoPublish(thread_call_param_t, thread_call_param_t) {
 	auto *svc = OSDynamicCast(IOService, reinterpret_cast<OSObject *>(gTopoAcc));
@@ -12534,8 +12535,79 @@ static void xeStatsPublish(thread_call_param_t, thread_call_param_t) {
 		svc->setProperty("xe-sls2-dp-signal", gDpSignalN, 32);
 		svc->setProperty("xe-sls2-disp-stamp", gDispStampN, 32);
 	}
+	xeIrqHealthTick(svc);
 	if (gStatsTc) {
 		uint64_t dl = 0; clock_interval_to_deadline(2000, kMillisecondScale, &dl);
 		thread_call_enter_delayed(gStatsTc, dl);
+	}
+}
+
+
+// SLS2: interrupt health. The boot watchdog (V54/V65) re-enables the GT interrupt routing only during the first
+// 10 s. If Apple's code later masks it again (RC6 exit, power-state change), completion interrupts get lost and
+// WindowServer hits "timed out fence". This runs a 250 ms sampler thread forever: counts every time an enable/
+// unmask is found missing (and puts it back, same writes as V54/V65; ngreenirqfix=0 = count only) and every time
+// a GT interrupt stays pending across two samples (raised but never serviced).
+static thread_call_t gIrqTc = nullptr;
+static volatile uint32_t gIrqTicks = 0, gIrqMstrOff = 0, gIrqTier1Off = 0, gIrqRcsMasked = 0, gIrqBcsMasked = 0,
+	gIrqStuck = 0, gIrqPending = 0, gIrqFixes = 0;
+static uint32_t gIrqLastDw0 = 0;
+static int xeIrqFixMode() {
+	static int m = -1;
+	if (m < 0) { int v = 1; PE_parse_boot_argn("ngreenirqfix", &v, sizeof(v)); m = v ? 1 : 0; }
+	return m;
+}
+static void xeIrqSample(thread_call_param_t, thread_call_param_t) {
+	if (NGreen::callback && gTopoAcc) {
+		gIrqTicks++;
+		const bool fix = xeIrqFixMode() == 1;
+		uint32_t mstr = NGreen::callback->readReg32(GEN11_GFX_MSTR_IRQ);
+		if (!(mstr & GEN11_MASTER_IRQ)) {
+			gIrqMstrOff++;
+			if (fix) { NGreen::callback->writeReg32(GEN11_GFX_MSTR_IRQ, GEN11_MASTER_IRQ); gIrqFixes++; }
+		}
+		uint32_t want = getV65Tier1WantBits(NGreen::callback->isRealTGL);
+		uint32_t en = NGreen::callback->readReg32(GEN11_RENDER_COPY_INTR_ENABLE);
+		if ((en & want) != want) {
+			gIrqTier1Off++;
+			if (fix) { NGreen::callback->writeReg32(GEN11_RENDER_COPY_INTR_ENABLE, en | want); gIrqFixes++; }
+		}
+		const uint32_t unm = GT_CONTEXT_SWITCH_INTERRUPT | GT_RENDER_USER_INTERRUPT;
+		uint32_t rm = NGreen::callback->readReg32(GEN11_RCS0_RSVD_INTR_MASK);
+		if (rm & unm) {
+			gIrqRcsMasked++;
+			if (fix) { NGreen::callback->writeReg32(GEN11_RCS0_RSVD_INTR_MASK, rm & ~unm); gIrqFixes++; }
+		}
+		if (want & (1u << GEN11_BCS)) {
+			uint32_t bm = NGreen::callback->readReg32(GEN11_BCS_RSVD_INTR_MASK);
+			if (bm & unm) {
+				gIrqBcsMasked++;
+				if (fix) { NGreen::callback->writeReg32(GEN11_BCS_RSVD_INTR_MASK, bm & ~unm); gIrqFixes++; }
+			}
+		}
+		uint32_t dw0 = NGreen::callback->readReg32(GEN11_GT_INTR_DW0);
+		if (dw0) gIrqPending++;
+		if (dw0 && (dw0 & gIrqLastDw0)) gIrqStuck++;   // same source still pending 250 ms later
+		gIrqLastDw0 = dw0;
+	}
+	if (gIrqTc) {
+		uint64_t dl = 0; clock_interval_to_deadline(250, kMillisecondScale, &dl);
+		thread_call_enter_delayed(gIrqTc, dl);
+	}
+}
+static void xeIrqHealthTick(IOService *svc) {
+	if (!gIrqTc) {
+		gIrqTc = thread_call_allocate(xeIrqSample, nullptr);
+		if (gIrqTc) thread_call_enter(gIrqTc);
+	}
+	if (svc) {
+		svc->setProperty("xe-sls2-irq-ticks", gIrqTicks, 32);
+		svc->setProperty("xe-sls2-irq-mstr-off", gIrqMstrOff, 32);
+		svc->setProperty("xe-sls2-irq-tier1-off", gIrqTier1Off, 32);
+		svc->setProperty("xe-sls2-irq-rcs-masked", gIrqRcsMasked, 32);
+		svc->setProperty("xe-sls2-irq-bcs-masked", gIrqBcsMasked, 32);
+		svc->setProperty("xe-sls2-irq-pending", gIrqPending, 32);
+		svc->setProperty("xe-sls2-irq-stuck", gIrqStuck, 32);
+		svc->setProperty("xe-sls2-irq-fixes", gIrqFixes, 32);
 	}
 }
