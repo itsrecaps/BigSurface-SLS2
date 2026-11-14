@@ -55,6 +55,8 @@ static int xeAuxBlMode() {
 	return m;
 }
 static bool xeAuxBlHdr() { return xeAuxBlMode() >= 3; }
+static void xeStatsPublish(thread_call_param_t, thread_call_param_t);  // SLS2 lag stats (defined at end of file)
+static thread_call_t gStatsTc = nullptr;
 static void xeTopoPublish(thread_call_param_t, thread_call_param_t) {
 	auto *svc = OSDynamicCast(IOService, reinterpret_cast<OSObject *>(gTopoAcc));
 	if (svc) svc->setProperty("xe-topo", (gTopoSs * 8) << 8 | gTopoL3, 32);
@@ -75,6 +77,13 @@ static void xeTopoPublish(thread_call_param_t, thread_call_param_t) {
 		svc->setProperty("xe-rowchk-pre", gRc2Pre, 32);
 		svc->setProperty("xe-rowchk-post", gRc2Post, 32);
 		svc->setProperty("xe-rowchk-n", gRc2N, 32);
+	}
+	if (!gStatsTc) {
+		gStatsTc = thread_call_allocate(xeStatsPublish, nullptr);
+		if (gStatsTc) {
+			uint64_t dl = 0; clock_interval_to_deadline(2000, kMillisecondScale, &dl);
+			thread_call_enter_delayed(gStatsTc, dl);
+		}
 	}
 }
 static thread_call_t gTopoTc = nullptr;
@@ -12503,4 +12512,30 @@ static bool xeBlitFixInstall(KernelPatcher &patcher, KernelPatcher::KextInfo *ke
 	memcpy(blk + 20, tail, sizeof(tail));
 	LookupPatchPlus const p[] = {{kext, v2, blk, sizeof(blk), 1}};
 	return LookupPatchPlus::applyAll(patcher, p, address, size);
+}
+
+
+// SLS2: publish the submit/stall counters every 2 s on the accelerator so lag spikes can be matched to them
+// (ioreg -c IntelAccelerator | grep xe-sls2). Read-only.
+static void xeStatsPublish(thread_call_param_t, thread_call_param_t) {
+	auto *svc = OSDynamicCast(IOService, reinterpret_cast<OSObject *>(gTopoAcc));
+	if (svc) {
+		svc->setProperty("xe-sls2-idlw-n", gIdlwN, 32);
+		svc->setProperty("xe-sls2-idlw-ms", (uint32_t)(gIdlwUs / 1000), 32);
+		svc->setProperty("xe-sls2-idlw-max-us", gIdlwMax, 32);
+		svc->setProperty("xe-sls2-idlw-timeouts", gIdlwTimeout, 32);
+		svc->setProperty("xe-sls2-csb-resync", gCsbResyncN, 32);
+		svc->setProperty("xe-sls2-csb-skip", gCsbSkipN, 32);
+		svc->setProperty("xe-sls2-s5-push", gS5PushN, 32);
+		svc->setProperty("xe-sls2-cs5-submit", gCs5SubmitN, 32);
+		svc->setProperty("xe-sls2-dp-submit", gDpSubmitN, 32);
+		svc->setProperty("xe-sls2-dp-iscomp", gDpIsCompN, 32);
+		svc->setProperty("xe-sls2-dp-iscomp-true", gDpIsCompTrue, 32);
+		svc->setProperty("xe-sls2-dp-signal", gDpSignalN, 32);
+		svc->setProperty("xe-sls2-disp-stamp", gDispStampN, 32);
+	}
+	if (gStatsTc) {
+		uint64_t dl = 0; clock_interval_to_deadline(2000, kMillisecondScale, &dl);
+		thread_call_enter_delayed(gStatsTc, dl);
+	}
 }
