@@ -12566,7 +12566,7 @@ static void xeIrqSample(thread_call_param_t, thread_call_param_t) {
 			gIrqMstrOff++;
 			if (fix) { NGreen::callback->writeReg32(GEN11_GFX_MSTR_IRQ, GEN11_MASTER_IRQ); gIrqFixes++; }
 		}
-		uint32_t want = getV65Tier1WantBits(NGreen::callback->isRealTGL);
+		uint32_t want = getV65Tier1WantBits(false);
 		uint32_t en = NGreen::callback->readReg32(GEN11_RENDER_COPY_INTR_ENABLE);
 		if ((en & want) != want) {
 			gIrqTier1Off++;
