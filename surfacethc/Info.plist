@@ -8,8 +8,8 @@
 	<key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
 	<key>CFBundleName</key><string>SurfaceTHC</string>
 	<key>CFBundlePackageType</key><string>KEXT</string>
-	<key>CFBundleShortVersionString</key><string>0.6.0</string>
-	<key>CFBundleVersion</key><string>0.6.0</string>
+	<key>CFBundleShortVersionString</key><string>0.7.0</string>
+	<key>CFBundleVersion</key><string>0.7.0</string>
 	<key>IOKitPersonalities</key>
 	<dict>
 		<key>SurfaceTHCProbe</key>
@@ -19,6 +19,15 @@
 			<key>IOPCIMatch</key><string>0x51d08086 0x51d18086</string>
 			<key>IOProviderClass</key><string>IOPCIDevice</string>
 			<key>IOProbeScore</key><integer>1000</integer>
+		</dict>
+		<key>SurfaceGfxProbe</key>
+		<dict>
+			<key>CFBundleIdentifier</key><string>com.itsrecaps.SurfaceTHC</string>
+			<key>IOClass</key><string>SurfaceGfxProbe</string>
+			<key>IOPCIClassMatch</key><string>0x03000000&amp;0xff000000</string>
+			<key>IOProviderClass</key><string>IOPCIDevice</string>
+			<key>IOMatchCategory</key><string>SurfaceGfxProbe</string>
+			<key>IOProbeScore</key><integer>10</integer>
 		</dict>
 	</dict>
 	<key>OSBundleLibraries</key>

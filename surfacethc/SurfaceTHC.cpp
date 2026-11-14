@@ -585,6 +585,89 @@ void SurfaceTHCProbe::listen() {
 	IOLog("SurfaceTHC: %s listen done, %u reports\n", acpiName, count);
 }
 
+// ---------- SurfaceGfxProbe: read-only sampler of the iGPU frequency (lag investigation) ----------
+class SurfaceGfxProbe : public IOService {
+	OSDeclareDefaultStructors(SurfaceGfxProbe)
+public:
+	bool start(IOService *provider) override;
+	void stop(IOService *provider) override;
+private:
+	IOMemoryMap *gmap {nullptr};
+	volatile bool stopping {false}, running {false};
+	static void entry(void *arg, wait_result_t);
+	void sample();
+	uint32_t rr(uint32_t off) { return *reinterpret_cast<volatile uint32_t *>(gmap->getVirtualAddress() + off); }
+};
+OSDefineMetaClassAndStructors(SurfaceGfxProbe, IOService)
+
+bool SurfaceGfxProbe::start(IOService *provider) {
+	if (!IOService::start(provider)) return false;
+	IOPCIDevice *pci = OSDynamicCast(IOPCIDevice, provider);
+	if (!pci || pci->configRead16(0) != 0x8086) return false;
+	setProperty("GFX-device", pci->configRead16(2), 16);
+	IODeviceMemory *mem = pci->getDeviceMemoryWithRegister(kIOPCIConfigBaseAddress0);
+	if (mem) gmap = mem->map(kIOMapInhibitCache);
+	if (!gmap || gmap->getLength() < 0x150000) { setProperty("GFX-error", "map failed"); registerService(); return true; }
+	setProperty("GFX-rp-state-cap", rr(0x145998), 32);
+	setProperty("GFX-rp-int-limits", rr(0xA014), 32);
+	thread_t th; retain(); running = true;
+	if (kernel_thread_start(&SurfaceGfxProbe::entry, this, &th) == KERN_SUCCESS) thread_deallocate(th);
+	else { running = false; release(); }
+	registerService();
+	return true;
+}
+
+void SurfaceGfxProbe::stop(IOService *provider) {
+	stopping = true;
+	for (int i = 0; i < 100 && running; i++) IOSleep(10);
+	OSSafeReleaseNULL(gmap);
+	IOService::stop(provider);
+}
+
+void SurfaceGfxProbe::entry(void *arg, wait_result_t) {
+	SurfaceGfxProbe *self = static_cast<SurfaceGfxProbe *>(arg);
+	self->sample(); self->running = false; self->release();
+	thread_terminate(current_thread());
+}
+
+void SurfaceGfxProbe::sample() {
+	// Every 250 ms for 10 min, after a 60 s settle. Publishes a histogram of the current GT
+	// frequency (RPSTAT1 CAGF, gen9+ units of 50/3 MHz) plus the requested frequency.
+	uint32_t hist[16] = {0}, reqHist[16] = {0}, n = 0, maxMHz = 0, minMHz = 99999;
+	uint64_t sum = 0;
+	for (int i = 0; i < 240 && !stopping; i++) IOSleep(250);
+	for (uint32_t k = 0; k < 2400 && !stopping; k++) {
+		uint32_t st = rr(0xA01C), rq = rr(0xA008);
+		uint32_t mhz = ((st >> 23) & 0x1FF) * 50 / 3;
+		uint32_t rmhz = ((rq >> 23) & 0x1FF) * 50 / 3;
+		hist[mhz / 100 < 15 ? mhz / 100 : 15]++;
+		reqHist[rmhz / 100 < 15 ? rmhz / 100 : 15]++;
+		sum += mhz; n++;
+		if (mhz > maxMHz) maxMHz = mhz;
+		if (mhz < minMHz) minMHz = mhz;
+		if ((k % 40) == 39) {
+			OSDictionary *d = OSDictionary::withCapacity(8);
+			if (d) {
+				char buf[200]; int p = 0;
+				for (int b = 0; b < 16; b++) p += snprintf(buf + p, sizeof(buf) - p, "%u ", hist[b]);
+				OSString *h = OSString::withCString(buf); if (h) { d->setObject("cur-MHz-histogram-100MHz-buckets", h); h->release(); }
+				p = 0;
+				for (int b = 0; b < 16; b++) p += snprintf(buf + p, sizeof(buf) - p, "%u ", reqHist[b]);
+				h = OSString::withCString(buf); if (h) { d->setObject("req-MHz-histogram-100MHz-buckets", h); h->release(); }
+				OSNumber *v;
+				if ((v = OSNumber::withNumber(n, 32))) { d->setObject("samples", v); v->release(); }
+				if ((v = OSNumber::withNumber(n ? sum / n : 0, 32))) { d->setObject("avg-MHz", v); v->release(); }
+				if ((v = OSNumber::withNumber(maxMHz, 32))) { d->setObject("max-MHz", v); v->release(); }
+				if ((v = OSNumber::withNumber(minMHz, 32))) { d->setObject("min-MHz", v); v->release(); }
+				if ((v = OSNumber::withNumber(st, 32))) { d->setObject("last-rpstat1", v); v->release(); }
+				if ((v = OSNumber::withNumber(rq, 32))) { d->setObject("last-rpnswreq", v); v->release(); }
+				setProperty("GFX-freq", d); d->release();
+			}
+		}
+		IOSleep(250);
+	}
+}
+
 bool SurfaceTHCProbe::start(IOService *provider) {
 	if (!IOService::start(provider)) return false;
 	IOPCIDevice *pci = OSDynamicCast(IOPCIDevice, provider);
