@@ -463,7 +463,23 @@ static bool xeBlitFixInstall(KernelPatcher &patcher, KernelPatcher::KextInfo *ke
 static uint8_t *volatile gAccelObj = nullptr;  // xe/csstate: IntelAccelerator (capturado em signalDisplayStampUpdate)
 static mach_vm_address_t gOrgDpSubmit = 0, gOrgDpIsComplete = 0, gOrgDpSignal = 0, gOrgDispStamp = 0;
 static volatile uint32_t gDpSubmitN = 0, gDpIsCompN = 0, gDpIsCompTrue = 0, gDpSignalN = 0, gDispStampN = 0;
+// SLS2 frame timing: submit -> isComplete(true) latency per display transaction, and the gap between submits.
+// Buckets (ms): <2, 2-4, 4-8, 8-16, 16-33, 33-66, 66+. Read-only.
+static struct { void *t; uint64_t at; } gFtSlot[16];
+static volatile uint32_t gFtLat[7], gFtGap[7], gFtLatMaxUs = 0;
+static volatile uint64_t gFtLatSumUs = 0, gFtLatN = 0, gFtLastSub = 0;
+static inline uint32_t xeFtBucket(uint64_t us) {
+	return us < 2000 ? 0 : us < 4000 ? 1 : us < 8000 ? 2 : us < 16000 ? 3 : us < 33000 ? 4 : us < 66000 ? 5 : 6;
+}
+static inline uint64_t xeNowUs() { uint64_t a; clock_get_uptime(&a); uint64_t ns; absolutetime_to_nanoseconds(a, &ns); return ns / 1000; }
 static uint64_t xeDpSubmit(void *that, void *t) {
+	{
+		uint64_t now = xeNowUs();
+		if (gFtLastSub) gFtGap[xeFtBucket(now - gFtLastSub)]++;
+		gFtLastSub = now;
+		uint32_t i = (uint32_t)(((uintptr_t)t >> 4) & 15);
+		gFtSlot[i].t = t; gFtSlot[i].at = now;
+	}
 	uint32_t n = ++gDpSubmitN;
 	xeEv('FSUB', n, gDpIsCompTrue, gDpSignalN);
 	return FunctionCast(xeDpSubmit, gOrgDpSubmit)(that, t);
@@ -471,7 +487,17 @@ static uint64_t xeDpSubmit(void *that, void *t) {
 static bool xeDpIsComplete(void *that, void *t) {
 	bool r = FunctionCast(xeDpIsComplete, gOrgDpIsComplete)(that, t);
 	uint32_t n = ++gDpIsCompN;
-	if (r) gDpIsCompTrue++;
+	if (r) {
+		gDpIsCompTrue++;
+		uint32_t i = (uint32_t)(((uintptr_t)t >> 4) & 15);
+		if (gFtSlot[i].t == t && gFtSlot[i].at) {
+			uint64_t d = xeNowUs() - gFtSlot[i].at;
+			gFtSlot[i].at = 0;
+			gFtLat[xeFtBucket(d)]++;
+			gFtLatSumUs += d; gFtLatN++;
+			if (d > gFtLatMaxUs) gFtLatMaxUs = (uint32_t)(d > 0xffffffffull ? 0xffffffffu : d);
+		}
+	}
 	if (n <= 400) xeEv('FISC', n, r, gDpIsCompTrue);
 	return r;
 }
@@ -12559,6 +12585,11 @@ static void xeStatsPublish(thread_call_param_t, thread_call_param_t) {
 		svc->setProperty("xe-sls2-subhz", subHz, 32);
 		svc->setProperty("xe-sls2-stamphz", stHz, 32);
 		svc->setProperty("xe-sls2-sighz", sigHz, 32);
+		static const char *const ln[7] = {"xe-sls2-lat-0", "xe-sls2-lat-2", "xe-sls2-lat-4", "xe-sls2-lat-8", "xe-sls2-lat-16", "xe-sls2-lat-33", "xe-sls2-lat-66"};
+		static const char *const gp[7] = {"xe-sls2-gap-0", "xe-sls2-gap-2", "xe-sls2-gap-4", "xe-sls2-gap-8", "xe-sls2-gap-16", "xe-sls2-gap-33", "xe-sls2-gap-66"};
+		for (int i = 0; i < 7; i++) { svc->setProperty(ln[i], gFtLat[i], 32); svc->setProperty(gp[i], gFtGap[i], 32); }
+		svc->setProperty("xe-sls2-lat-avg-us", (uint32_t)(gFtLatN ? gFtLatSumUs / gFtLatN : 0), 32);
+		svc->setProperty("xe-sls2-lat-max-us", gFtLatMaxUs, 32);
 		// worst (lowest) flip rate seen in a busy window, and a 0..120+ histogram of flip rates on pipe A
 		static uint32_t hist[5];  // <30, 30-59, 60-89, 90-114, 115+
 		uint32_t fa = flipHz[0];
