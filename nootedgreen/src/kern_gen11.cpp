@@ -463,6 +463,19 @@ static bool xeBlitFixInstall(KernelPatcher &patcher, KernelPatcher::KextInfo *ke
 static uint8_t *volatile gAccelObj = nullptr;  // xe/csstate: IntelAccelerator (capturado em signalDisplayStampUpdate)
 static mach_vm_address_t gOrgDpSubmit = 0, gOrgDpIsComplete = 0, gOrgDpSignal = 0, gOrgDispStamp = 0;
 static volatile uint32_t gDpSubmitN = 0, gDpIsCompN = 0, gDpIsCompTrue = 0, gDpSignalN = 0, gDispStampN = 0;
+// SLS2 vbldiag
+static mach_vm_address_t gOrgVblInvoke = 0, gOrgVblConfig = 0;
+static volatile uint32_t gVblN = 0, gVblEn = 0, gVblDis = 0, gVblRouted = 0, gVblLastOn = 0;
+static uint64_t xeVblInvoke(void *that, uint32_t pipe) {
+	gVblN++;
+	return FunctionCast(xeVblInvoke, gOrgVblInvoke)(that, pipe);
+}
+static uint64_t xeVblConfig(void *that, void *fb, void *path, bool on, bool b2) {
+	if (on) gVblEn++; else gVblDis++;
+	gVblLastOn = on ? 1 : 0;
+	return FunctionCast(xeVblConfig, gOrgVblConfig)(that, fb, path, on, b2);
+}
+
 // SLS2 frame timing: submit -> isComplete(true) latency per display transaction, and the gap between submits.
 // Buckets (ms): <2, 2-4, 4-8, 8-16, 16-33, 33-66, 66+. Read-only.
 static struct { void *t; uint64_t at; } gFtSlot[16];
@@ -1514,6 +1527,13 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 		};
 		PANIC_COND(!RouteRequestPlus::routeAll(patcher, index, requests, address, size), "ngreen","Failed to route dp symbols");
 		gTglFbRoutesDone++;
+		// SLS2 vbldiag: count vblank interrupt dispatches and VBL interrupt enable/disable requests (read-only)
+		{
+			RouteRequestPlus vbl1[] = {{"__ZN31AppleIntelFramebufferController25invokeVBLInterruptHandlerEj", xeVblInvoke, gOrgVblInvoke}};
+			if (!RouteRequestPlus::routeAll(patcher, index, vbl1, address, size)) { patcher.clearError(); gVblRouted |= 0; } else gVblRouted |= 1;
+			RouteRequestPlus vbl2[] = {{"__ZN24AppleIntelBaseController23hwConfigureVBLInterruptEP21AppleIntelFramebufferP21AppleIntelDisplayPathbb", xeVblConfig, gOrgVblConfig}};
+			if (!RouteRequestPlus::routeAll(patcher, index, vbl2, address, size)) patcher.clearError(); else gVblRouted |= 2;
+		}
 		if (xeAuxBlMode()) {
 			gXeAuxBlWr = patcher.solveSymbol(index, "__ZN14AppleIntelPort8writeAUXEjPvj", address, size);
 			patcher.clearError();
@@ -12572,6 +12592,17 @@ static void xeStatsPublish(thread_call_param_t, thread_call_param_t) {
 		svc->setProperty("xe-sls2-dp-iscomp-true", gDpIsCompTrue, 32);
 		svc->setProperty("xe-sls2-dp-signal", gDpSignalN, 32);
 		svc->setProperty("xe-sls2-disp-stamp", gDispStampN, 32);
+		{
+			static uint32_t lastV = 0; static bool hv = false;
+			uint32_t v = gVblN;
+			svc->setProperty("xe-sls2-vbl-hz", hv ? (v - lastV) / 2 : 0, 32);
+			lastV = v; hv = true;
+		}
+		svc->setProperty("xe-sls2-vbl-n", gVblN, 32);
+		svc->setProperty("xe-sls2-vbl-en", gVblEn, 32);
+		svc->setProperty("xe-sls2-vbl-dis", gVblDis, 32);
+		svc->setProperty("xe-sls2-vbl-on", gVblLastOn, 32);
+		svc->setProperty("xe-sls2-vbl-routed", gVblRouted, 32);
 		svc->setProperty("xe-sls2-tx-irq", dpTxIrqN, 32);
 		svc->setProperty("xe-sls2-tx-timeout", dpTxTimeoutN, 32);
 		svc->setProperty("xe-sls2-tx-complete", dpCompleteN, 32);
