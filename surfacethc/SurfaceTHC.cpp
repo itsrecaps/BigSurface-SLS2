@@ -40,6 +40,8 @@ private:
 	VoodooInputEvent vevt;
 	TouchCoordinates prevCoord[8];
 	int setFeature(uint8_t id, uint8_t value);
+	int getFeature(uint8_t id);
+	uint32_t rxId[256] {};
 	uint32_t lastFeatResp {0}, rx80 {0}, rx81 {0};
 	void handlePtp(const uint8_t *c, uint32_t n);
 public:
@@ -422,6 +424,8 @@ void SurfaceTHCProbe::bringUp(IOACPIPlatformDevice *acpi) {
 			note("ptp-inputmode", (uint64_t)(int64_t)a); note("ptp-inputmode-resp", lastFeatResp);
 			int b2 = setFeature(0x85, 3);
 			note("ptp-selective", (uint64_t)(int64_t)b2); note("ptp-selective-resp", lastFeatResp);
+			int g = getFeature(0x84);
+			note("ptp-inputmode-readback", (uint64_t)(int64_t)g); note("ptp-readback-resp", lastFeatResp);
 			if (a == 0) {
 				ptp = true;
 				setProperty("VoodooInputSupported", kOSBooleanTrue);
@@ -446,10 +450,9 @@ done:
 
 // ---------- precision touchpad (report 0x81) -> VoodooInput ----------
 int SurfaceTHCProbe::setFeature(uint8_t id, uint8_t value) {
-	// HIDSPI output report: type 3 = SET_FEATURE, content_id = report id. The content is the feature report as
-	// HID core hands it to the transport (Linux quickspi), i.e. it starts with the report id: [id][value], len 2.
-	// 0.7.0 sent only [value] with len 1, which the touchpad acked but read as report id 3 -> mode never changed.
-	uint32_t pkt[2] = { (uint32_t)0x03 | (2u << 8) | ((uint32_t)id << 24), (uint32_t)id | ((uint32_t)value << 8) };
+	// HIDSPI output report: type 3 = SET_FEATURE, content_id = report id, content = feature data WITHOUT the
+	// report id (Linux quickspi_set_report sends buf + 1, len - 1). 0.7.0 had this right; 0.7.1 was wrong.
+	uint32_t pkt[2] = { (uint32_t)0x03 | (1u << 8) | ((uint32_t)id << 24), value };
 	int e = pioWrite(outAddr, 8, pkt);
 	if (e) return e;
 	uint32_t cause = 0, buf[16], got = 0;
@@ -459,6 +462,23 @@ int SurfaceTHCProbe::setFeature(uint8_t id, uint8_t value) {
 	pioRead(bodyAddr ? bodyAddr : 0x1004, len == 0 ? 4 : (len > 64 ? 64 : len), buf, &got);   // SET_FEATURE_RESPONSE
 	lastFeatResp = buf[0];
 	return 0;
+}
+
+// GET_FEATURE (output type 4, len 0, content_id = report id). Response type 5: [5][len][id][data...].
+// Returns the first data byte, or a negative error.
+int SurfaceTHCProbe::getFeature(uint8_t id) {
+	uint32_t pkt[1] = { (uint32_t)0x04 | ((uint32_t)id << 24) };
+	int e = pioWrite(outAddr, 4, pkt);
+	if (e) return e;
+	uint32_t cause = 0, buf[16], got = 0;
+	if (!waitNonDmaInt(1000, &cause)) return -10;
+	uint32_t len = ((cause >> 8) & 0x3FFF) * 4;
+	bzero(buf, sizeof(buf));
+	pioRead(bodyAddr ? bodyAddr : 0x1004, len == 0 ? 4 : (len > 64 ? 64 : len), buf, &got);
+	lastFeatResp = buf[0];
+	const uint8_t *b = (const uint8_t *)buf;
+	if (b[0] != 5) return -20 - b[0];
+	return b[4];
 }
 
 bool SurfaceTHCProbe::handleOpen(IOService *forClient, IOOptionBits options, void *arg) {
@@ -533,6 +553,15 @@ void SurfaceTHCProbe::listen() {
 		count++;
 		const uint8_t *b = (const uint8_t *)buf;
 		// HIDSPI body: [type][len lo][len hi][report id][content...]; touchpad mouse report = id 0x80, 3 bytes
+		if (!e) {
+			uint32_t k = (uint32_t)b[0] << 8 | b[3];   // type:id
+			uint32_t n = ++rxId[b[3]];
+			if (n == 1 || !(n & 511)) {
+				char nm[24]; snprintf(nm, sizeof(nm), "rxid-%02x-%02x", b[0], b[3]);
+				setProperty(nm, n, 32);
+			}
+			(void)k;
+		}
 		if (!e && b[0] == 1 && b[3] == 0x81) {
 			if (!(rx81++ & 255)) setProperty("rx-81", rx81, 32);
 			if (got >= 33) handlePtp(b + 4, got - 4);
