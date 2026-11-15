@@ -12551,7 +12551,10 @@ static void xeStatsPublish(thread_call_param_t, thread_call_param_t) {
 static thread_call_t gIrqTc = nullptr;
 static volatile uint32_t gIrqTicks = 0, gIrqMstrOff = 0, gIrqTier1Off = 0, gIrqRcsMasked = 0, gIrqBcsMasked = 0,
 	gIrqStuck = 0, gIrqPending = 0, gIrqFixes = 0, gIrqKicks = 0, gIrqKickGiveup = 0, gIrqStuckBits = 0;
-static uint32_t gIrqLastDw0 = 0, gIrqKickRun = 0;
+static uint32_t gIrqLastDw0 = 0, gIrqKickRun = 0, gIrqMstrRun = 0, gIrqEpLen = 0;
+// stuck episode length histogram, in sampler periods: 1, 2-3, 4-7, 8-15, 16-63, 64+
+static volatile uint32_t gIrqEp[6] = {};
+static uint32_t gIrqEpMax = 0;
 // SLS2 v2: a GT interrupt left pending means its MSI edge was lost, so Apple's handler never ran and the fence
 // waits until WindowServer times out (the lag spikes). Kick = re-arm the master enable (same 0 then MASTER write
 // i915's gen11 handler does) so a pending source fires a fresh MSI. Only kicks while the master reads enabled
@@ -12559,7 +12562,7 @@ static uint32_t gIrqLastDw0 = 0, gIrqKickRun = 0;
 // ngreenirqkick=0 = off. ngreenirqms = sampler period (default 8 ms, was 250).
 static int xeIrqKickMode() {
 	static int m = -1;
-	if (m < 0) { int v = 1; PE_parse_boot_argn("ngreenirqkick", &v, sizeof(v)); m = v ? 1 : 0; }
+	if (m < 0) { int v = 0; PE_parse_boot_argn("ngreenirqkick", &v, sizeof(v)); m = v ? 1 : 0; }
 	return m;
 }
 static uint32_t xeIrqPeriodMs() {
@@ -12577,9 +12580,16 @@ static void xeIrqSample(thread_call_param_t, thread_call_param_t) {
 		gIrqTicks++;
 		const bool fix = xeIrqFixMode() == 1;
 		uint32_t mstr = NGreen::callback->readReg32(GEN11_GFX_MSTR_IRQ);
+		// Apple's interrupt filter clears master until its workloop has serviced the interrupt, so a single
+		// "off" sample is normal at an 8 ms period. Only count/repair it when it stays off for 3 periods.
 		if (!(mstr & GEN11_MASTER_IRQ)) {
-			gIrqMstrOff++;
-			if (fix) { NGreen::callback->writeReg32(GEN11_GFX_MSTR_IRQ, GEN11_MASTER_IRQ); gIrqFixes++; }
+			if (++gIrqMstrRun == 3) {
+				gIrqMstrOff++;
+				if (fix) { NGreen::callback->writeReg32(GEN11_GFX_MSTR_IRQ, GEN11_MASTER_IRQ); gIrqFixes++; }
+				gIrqMstrRun = 0;
+			}
+		} else {
+			gIrqMstrRun = 0;
 		}
 		uint32_t want = getV65Tier1WantBits(false);
 		uint32_t en = NGreen::callback->readReg32(GEN11_RENDER_COPY_INTR_ENABLE);
@@ -12621,6 +12631,14 @@ static void xeIrqSample(thread_call_param_t, thread_call_param_t) {
 		} else {
 			gIrqKickRun = 0;
 		}
+		if (stuck) {
+			gIrqEpLen++;
+		} else if (gIrqEpLen) {
+			uint32_t L = gIrqEpLen, b = L < 2 ? 0 : L < 4 ? 1 : L < 8 ? 2 : L < 16 ? 3 : L < 64 ? 4 : 5;
+			gIrqEp[b]++;
+			if (L > gIrqEpMax) gIrqEpMax = L;
+			gIrqEpLen = 0;
+		}
 		gIrqLastDw0 = dw0;
 	}
 	if (gIrqTc) {
@@ -12646,5 +12664,8 @@ static void xeIrqHealthTick(IOService *svc) {
 		svc->setProperty("xe-sls2-irq-giveup", gIrqKickGiveup, 32);
 		svc->setProperty("xe-sls2-irq-stuckbits", gIrqStuckBits, 32);
 		svc->setProperty("xe-sls2-irq-period-ms", xeIrqPeriodMs(), 32);
+		static const char *const epn[6] = {"xe-sls2-irq-ep1", "xe-sls2-irq-ep2", "xe-sls2-irq-ep4", "xe-sls2-irq-ep8", "xe-sls2-irq-ep16", "xe-sls2-irq-ep64"};
+		for (int i = 0; i < 6; i++) svc->setProperty(epn[i], gIrqEp[i], 32);
+		svc->setProperty("xe-sls2-irq-epmax", gIrqEpMax, 32);
 	}
 }
