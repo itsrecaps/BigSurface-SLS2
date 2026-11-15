@@ -517,7 +517,7 @@ static void xeDispStamp(void *that, int idx, uint32_t stamp) {
 // push (entrada na fila), notify, submitExecList (escrita no hardware), pause/resume.
 static mach_vm_address_t gOrgS5Push = 0, gOrgS5Notify = 0, gOrgCs5Submit = 0, gOrgS5Pause = 0, gOrgS5Resume = 0;
 static volatile uint32_t gS5PushN = 0, gS5NotifyN = 0, gCs5SubmitN = 0, gS5PauseN = 0, gS5ResumeN = 0;
-static uint32_t gThrtN = 0, gThrtSimN = 0;
+static uint32_t gThrtN = 0, gThrtSimN = 0, gThrtBand[4] = {};
 static volatile uint32_t gCsbResyncN = 0;  // 21/10: active->idle salvos pelo xeCsbResync (CSBR)
 static volatile uint32_t gCsbSkipN = 0;  // 19/10: eventos active->idle descartados pelo xeCsbA2I
 // 20/10: brilho (PWM sul 0xC8254 período / 0xC8258 duty), estilo BacklightRegistersFix do WhateverGreen
@@ -941,7 +941,18 @@ static uint64_t xeVerifyThr(void *that, bool *out) {
 	uint64_t r = FunctionCast(xeVerifyThr, gOrgVerifyThr)(that, out);
 	// 19/10: era chamado ~6000x/s (dequeueExecList em laço) e o log disso inundava o dmesg; agora só conta
 	__atomic_fetch_add(&gThrtN, 1, __ATOMIC_RELAXED);
-	if (out && *out) __atomic_fetch_add(&gThrtSimN, 1, __ATOMIC_RELAXED);
+	// SLS2: out is bool[4], one "throttle this priority band" flag per band (TGL disasm: setne (%r14,%rbx), 4x),
+	// read by evalWaitQueue. Apple's duty-cycle throttle holds a band back for runtime*pct/(100-pct). With
+	// runningboardd unable to set GPU priorities ("nil IOGPU device ref") WindowServer's work gets held back ->
+	// 33-66+ ms gaps between frames and CoreAnimation "timed out fence". Clear the flags (count first).
+	// -ngreenkeepthrottle = Apple's behaviour.
+	static int keep = -1;
+	if (keep < 0) keep = checkKernelArgument("-ngreenkeepthrottle") ? 1 : 0;
+	if (out) {
+		bool any = false;
+		for (int i = 0; i < 4; i++) if (out[i]) { any = true; __atomic_fetch_add(&gThrtBand[i], 1, __ATOMIC_RELAXED); if (!keep) out[i] = false; }
+		if (any) __atomic_fetch_add(&gThrtSimN, 1, __ATOMIC_RELAXED);
+	}
 	return r;
 }
 // xe/fwsubmit (19/10): a execlist escrita logo depois do fim do CSB se perdia (motor recém-ocioso em RC6). Segura o
@@ -12560,6 +12571,12 @@ static void xeStatsPublish(thread_call_param_t, thread_call_param_t) {
 		svc->setProperty("xe-sls2-dp-iscomp-true", gDpIsCompTrue, 32);
 		svc->setProperty("xe-sls2-dp-signal", gDpSignalN, 32);
 		svc->setProperty("xe-sls2-disp-stamp", gDispStampN, 32);
+		svc->setProperty("xe-sls2-thr-n", gThrtN, 32);
+		svc->setProperty("xe-sls2-thr-yes", gThrtSimN, 32);
+		svc->setProperty("xe-sls2-thr-b0", gThrtBand[0], 32);
+		svc->setProperty("xe-sls2-thr-b1", gThrtBand[1], 32);
+		svc->setProperty("xe-sls2-thr-b2", gThrtBand[2], 32);
+		svc->setProperty("xe-sls2-thr-b3", gThrtBand[3], 32);
 	}
 	xeIrqHealthTick(svc);
 	// SLS2: frame pacing. Hardware scanout frame counter and flip counter per pipe (PIPE_FRMCOUNT 0x70040 /
