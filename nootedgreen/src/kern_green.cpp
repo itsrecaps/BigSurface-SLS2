@@ -412,7 +412,7 @@ static void *wrapPoolGetPtr(void *that, uint32_t ndw) {
 // xe/flipdiag (19/10): lado do IOAF2 — quantas vezes a interrupção de transação (vblank) e o timer de timeout
 // chegam a rodar, e quantas transações são concluídas.
 static mach_vm_address_t orgDpTxIrq = 0, orgDpTxTimeout = 0, orgDpComplete = 0, orgDpQueue = 0;
-static volatile uint32_t dpTxIrqN = 0, dpTxTimeoutN = 0, dpCompleteN = 0, dpQueueN = 0;
+volatile uint32_t dpTxIrqN = 0, dpTxTimeoutN = 0, dpCompleteN = 0, dpQueueN = 0;
 static uint64_t wrapDpTxIrq(void *that) {
 	uint32_t n = ++dpTxIrqN;
 	if (n <= 24 || !(n & 4095)) IOLog("XeNG FLIP txIrq #%u (queue %u complete %u timeout %u)\n", n, dpQueueN, dpCompleteN, dpTxTimeoutN);
@@ -462,8 +462,19 @@ static void *wrapOrphanGet(void *that, void *shared, void *res, uint64_t size, v
 	return nullptr;
 }
 static mach_vm_address_t orgWaitForStamp = 0;
+// SLS2: how long kernel-side stamp waits (finish / waitUntilCompleted) block. Buckets ms: <2,2-4,4-8,8-16,16-33,33-66,66+
+volatile uint32_t gWfsHist[7] = {}, gWfsFail = 0, gWfsMaxUs = 0;
 static IOReturn wrapWaitForStamp(void *that, int32_t channel, unsigned int stamp, unsigned int *outStamp) {
+	uint64_t t0; clock_get_uptime(&t0);
 	IOReturn ret = FunctionCast(wrapWaitForStamp, orgWaitForStamp)(that, channel, stamp, outStamp);
+	{
+		uint64_t t1, ns; clock_get_uptime(&t1); absolutetime_to_nanoseconds(t1 - t0, &ns);
+		uint64_t us = ns / 1000;
+		uint32_t b = us < 2000 ? 0 : us < 4000 ? 1 : us < 8000 ? 2 : us < 16000 ? 3 : us < 33000 ? 4 : us < 66000 ? 5 : 6;
+		gWfsHist[b]++;
+		if (us > gWfsMaxUs) gWfsMaxUs = (uint32_t)(us > 0xffffffffull ? 0xffffffffu : us);
+		if (ret != kIOReturnSuccess) gWfsFail++;
+	}
 	if (ret != kIOReturnSuccess && !Gen11::gGfxAccelStartDone) {
 		// Stamp timed out before GFX start() completed. The GPU DID execute the ring
 		// (HEAD==TAIL, IPEHR=MI_REPORT_HEAD) but the interrupt handler isn't installed

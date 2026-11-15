@@ -12555,6 +12555,7 @@ static bool xeBlitFixInstall(KernelPatcher &patcher, KernelPatcher::KextInfo *ke
 
 // SLS2: publish the submit/stall counters every 2 s on the accelerator so lag spikes can be matched to them
 // (ioreg -c IntelAccelerator | grep xe-sls2). Read-only.
+extern volatile uint32_t dpTxIrqN, dpTxTimeoutN, dpCompleteN, dpQueueN, gWfsHist[7], gWfsFail, gWfsMaxUs;
 static void xeStatsPublish(thread_call_param_t, thread_call_param_t) {
 	auto *svc = OSDynamicCast(IOService, reinterpret_cast<OSObject *>(gTopoAcc));
 	if (svc) {
@@ -12571,6 +12572,14 @@ static void xeStatsPublish(thread_call_param_t, thread_call_param_t) {
 		svc->setProperty("xe-sls2-dp-iscomp-true", gDpIsCompTrue, 32);
 		svc->setProperty("xe-sls2-dp-signal", gDpSignalN, 32);
 		svc->setProperty("xe-sls2-disp-stamp", gDispStampN, 32);
+		svc->setProperty("xe-sls2-tx-irq", dpTxIrqN, 32);
+		svc->setProperty("xe-sls2-tx-timeout", dpTxTimeoutN, 32);
+		svc->setProperty("xe-sls2-tx-complete", dpCompleteN, 32);
+		svc->setProperty("xe-sls2-tx-queue", dpQueueN, 32);
+		static const char *const wn[7] = {"xe-sls2-wfs-0", "xe-sls2-wfs-2", "xe-sls2-wfs-4", "xe-sls2-wfs-8", "xe-sls2-wfs-16", "xe-sls2-wfs-33", "xe-sls2-wfs-66"};
+		for (int i = 0; i < 7; i++) svc->setProperty(wn[i], gWfsHist[i], 32);
+		svc->setProperty("xe-sls2-wfs-fail", gWfsFail, 32);
+		svc->setProperty("xe-sls2-wfs-max-us", gWfsMaxUs, 32);
 		svc->setProperty("xe-sls2-thr-n", gThrtN, 32);
 		svc->setProperty("xe-sls2-thr-yes", gThrtSimN, 32);
 		svc->setProperty("xe-sls2-thr-b0", gThrtBand[0], 32);
