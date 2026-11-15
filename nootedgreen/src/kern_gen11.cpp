@@ -12536,6 +12536,36 @@ static void xeStatsPublish(thread_call_param_t, thread_call_param_t) {
 		svc->setProperty("xe-sls2-disp-stamp", gDispStampN, 32);
 	}
 	xeIrqHealthTick(svc);
+	// SLS2: frame pacing. Hardware scanout frame counter and flip counter per pipe (PIPE_FRMCOUNT 0x70040 /
+	// PIPE_FLIPCOUNT 0x70044, +0x1000 per pipe; display registers, no forcewake), plus Apple's display submits
+	// and display stamps, all as per-second rates over the 2 s publish period. Read-only.
+	if (svc && NGreen::callback) {
+		static uint32_t lastFrm[4], lastFlip[4], lastSub, lastStamp, lastSig;
+		static bool have = false;
+		uint32_t frmHz[4], flipHz[4];
+		for (int i = 0; i < 4; i++) {
+			uint32_t f = NGreen::callback->readReg32(0x70040 + 0x1000 * i);
+			uint32_t g = NGreen::callback->readReg32(0x70044 + 0x1000 * i);
+			frmHz[i] = have ? (f - lastFrm[i]) / 2 : 0;
+			flipHz[i] = have ? (g - lastFlip[i]) / 2 : 0;
+			lastFrm[i] = f; lastFlip[i] = g;
+		}
+		uint32_t sub = gDpSubmitN, st = gDispStampN, sig = gDpSignalN;
+		uint32_t subHz = have ? (sub - lastSub) / 2 : 0, stHz = have ? (st - lastStamp) / 2 : 0, sigHz = have ? (sig - lastSig) / 2 : 0;
+		lastSub = sub; lastStamp = st; lastSig = sig; have = true;
+		static const char *const fn[4] = {"xe-sls2-scanhz-a", "xe-sls2-scanhz-b", "xe-sls2-scanhz-c", "xe-sls2-scanhz-d"};
+		static const char *const gn[4] = {"xe-sls2-fliphz-a", "xe-sls2-fliphz-b", "xe-sls2-fliphz-c", "xe-sls2-fliphz-d"};
+		for (int i = 0; i < 4; i++) { svc->setProperty(fn[i], frmHz[i], 32); svc->setProperty(gn[i], flipHz[i], 32); }
+		svc->setProperty("xe-sls2-subhz", subHz, 32);
+		svc->setProperty("xe-sls2-stamphz", stHz, 32);
+		svc->setProperty("xe-sls2-sighz", sigHz, 32);
+		// worst (lowest) flip rate seen in a busy window, and a 0..120+ histogram of flip rates on pipe A
+		static uint32_t hist[5];  // <30, 30-59, 60-89, 90-114, 115+
+		uint32_t fa = flipHz[0];
+		if (fa) { uint32_t b = fa < 30 ? 0 : fa < 60 ? 1 : fa < 90 ? 2 : fa < 115 ? 3 : 4; hist[b]++; }
+		static const char *const hn[5] = {"xe-sls2-flipa-lt30", "xe-sls2-flipa-30", "xe-sls2-flipa-60", "xe-sls2-flipa-90", "xe-sls2-flipa-115"};
+		for (int i = 0; i < 5; i++) svc->setProperty(hn[i], hist[i], 32);
+	}
 	if (gStatsTc) {
 		uint64_t dl = 0; clock_interval_to_deadline(2000, kMillisecondScale, &dl);
 		thread_call_enter_delayed(gStatsTc, dl);
