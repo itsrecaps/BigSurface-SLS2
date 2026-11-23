@@ -67,6 +67,5 @@ Running **macOS Tahoe 26.7.1 (25G241)** with OpenCore 1.0.8, based on
 3. Install the BigSurface keyboard build, then battery
 4. Touchpad: run the probe, then port Linux's Intel THC QuickSPI driver step by step
 5. Audio (AppleHDA root patch)
-6. School wifi (WPA2 Enterprise)
-7. Delete the old 26.7.3 volume ("Macintosh HD") once everything's stable
-8. Windows through OpenCore (Booter quirks)
+6. Delete the old 26.7.3 volume ("Macintosh HD") once everything's stable
+7. Windows through OpenCore (Booter quirks)
